@@ -1,0 +1,3251 @@
+﻿import {
+  ChatInputCommandInteraction,
+  EmbedBuilder,
+  SlashCommandBuilder,
+  TextChannel,
+  User
+} from 'discord.js';
+import { rate, Rating, rating } from 'openskill';
+import type { ExtendedClient } from '../bot.js';
+import { recordPlayerActivity, applyRatingDecay, applyDecayForPlayers } from '../bot.js';
+import { getOrCreatePlayer, updatePlayerRating, isPlayerRestricted, getAllPlayers } from '../db/player-utils.js';
+import { recordMatch, getRecentMatches, updateMatchTurnOrder, getOpponentsByGameIds, getPlayerGamesOnDateBefore, getDeckGamesOnDateBefore } from '../db/match-utils.js';
+import { 
+  getOrCreateDeck, 
+  updateDeckRating, 
+  recordDeckMatch,
+  getAllDecks
+} from '../db/deck-utils.js';
+import { saveMatchSnapshot } from '../utils/snapshot-utils.js';
+import { calculateElo, muFromElo } from '../utils/elo-utils.js';
+
+// Participation bonus: +1 Elo for playing a ranked game (max 5 per day)
+const PARTICIPATION_BONUS_ELO = 1;
+const MAX_DAILY_PARTICIPATION_BONUS = 5;
+import { generateUniqueGameId, recordGameId } from '../utils/game-id-utils.js';
+import { config } from '../config.js';
+import crypto from 'crypto';
+import { isExempt, getAlertOptIn } from '../utils/suspicion-utils.js';
+import { logRatingChange } from '../utils/rating-audit-utils.js';
+import { normalizeCommanderName, validateCommander } from '../utils/edhrec-utils.js';
+import { cleanupZeroPlayers, cleanupZeroDecks } from '../db/database-utils.js';
+import { logger } from '../utils/logger.js';
+
+function hasModAccess(userId: string): boolean {
+  return config.admins.includes(userId) || config.moderators.includes(userId);
+}
+
+// Rate limiting for Discord API calls
+class DiscordRateLimiter {
+  private userFetchQueue: Map<string, Promise<User | null>> = new Map();
+  private lastFetchTime = 0;
+  private readonly minInterval = 100; // 100ms between API calls
+
+  async fetchUserSafe(client: ExtendedClient, userId: string): Promise<User | null> {
+    // Return existing promise if already fetching this user
+    if (this.userFetchQueue.has(userId)) {
+      return this.userFetchQueue.get(userId)!;
+    }
+
+    const fetchPromise = this.performFetch(client, userId);
+    this.userFetchQueue.set(userId, fetchPromise);
+    
+    // Clean up after completion
+    fetchPromise.finally(() => {
+      this.userFetchQueue.delete(userId);
+    });
+
+    return fetchPromise;
+  }
+
+  private async performFetch(client: ExtendedClient, userId: string): Promise<User | null> {
+    try {
+      // Rate limiting - ensure minimum interval between calls
+      const now = Date.now();
+      const timeSinceLastFetch = now - this.lastFetchTime;
+      if (timeSinceLastFetch < this.minInterval) {
+        await new Promise(resolve => setTimeout(resolve, this.minInterval - timeSinceLastFetch));
+      }
+      this.lastFetchTime = Date.now();
+
+      const user = await client.users.fetch(userId);
+      return user;
+    } catch (error) {
+      logger.error(`Failed to fetch user ${userId}:`, error);
+      return null;
+    }
+  }
+}
+
+const rateLimiter = new DiscordRateLimiter();
+
+// Input validation utilities
+class InputValidator {
+  static validateUserId(userId: string): boolean {
+    // Discord user IDs are 17-19 digit numbers
+    return /^\d{17,19}$/.test(userId);
+  }
+
+  static validateGameId(gameId: string): boolean {
+  // Game IDs should be 6-8 alphanumeric characters, but "0" is special case for pre-injection
+  if (gameId === '0') return true;
+  return /^[A-Z0-9]{6,8}$/.test(gameId);
+}
+
+  static validateTurnOrder(turnOrder: number, maxPlayers: number = 2): boolean {
+    return Number.isInteger(turnOrder) && turnOrder >= 1 && turnOrder <= maxPlayers;
+  }
+
+  static validateCommanderName(commanderName: string): boolean {
+    // Free-form deck/team name (Pokémon TCG Pocket deck or Showdown team)
+    return /^[a-zA-Z0-9\s\-',.]+$/.test(commanderName) && commanderName.length >= 2 && commanderName.length <= 100;
+  }
+
+  static validateGameResult(result: string): result is 'w' | 'l' | 'd' {
+    return ['w', 'l', 'd'].includes(result.toLowerCase());
+  }
+
+  static validatePlayerCount(count: number, _isCEDHMode: boolean = true): boolean {
+    // PokemonSkill is strictly 1v1.
+    return count === 2;
+  }
+
+  static validateDeckCount(count: number): boolean {
+    // 1v1 deck-vs-deck matches.
+    return count === 2;
+  }
+
+  static validateResultCombination(results: string[]): { valid: boolean; error?: string } {
+    const winCount = results.filter(r => r === 'w').length;
+    const drawCount = results.filter(r => r === 'd').length;
+    const lossCount = results.filter(r => r === 'l').length;
+
+    if (results.length === 0) {
+      return { valid: false, error: 'No results provided' };
+    }
+
+    if (winCount + drawCount + lossCount !== results.length) {
+      return { valid: false, error: 'Invalid result format. Use only w (win), l (loss), or d (draw)' };
+    }
+
+    // PokemonSkill (1v1) — only three valid outcomes:
+    //   1. P1 wins, P2 loses (1w + 1l)
+    //   2. P1 loses, P2 wins (1w + 1l, just reversed)
+    //   3. Draw (2d)
+    if (winCount === 1 && lossCount === 1 && drawCount === 0) {
+      return { valid: true };
+    }
+    if (winCount === 0 && lossCount === 0 && drawCount === 2) {
+      return { valid: true };
+    }
+
+    return { valid: false, error: 'Invalid result combination. Must be either: 1 winner + 1 loser, or 2 draws' };
+  }
+
+
+  static validateTurnOrders(turnOrders: number[]): { valid: boolean; error?: string } {
+    const provided = turnOrders.filter(t => t > 0);
+    const unique = new Set(provided);
+
+    if (provided.length !== unique.size) {
+      return { valid: false, error: 'Duplicate turn orders detected' };
+    }
+
+    for (const turnOrder of provided) {
+      if (!this.validateTurnOrder(turnOrder)) {
+        return { valid: false, error: `Invalid turn order: ${turnOrder}. Must be 1 (went first) or 2 (went second)` };
+      }
+    }
+
+    return { valid: true };
+  }
+}
+
+// Enhanced error handling wrapper
+class DatabaseErrorHandler {
+  static async safeExecute<T>(
+    operation: () => Promise<T>, 
+    operationName: string,
+    fallbackValue?: T
+  ): Promise<{ success: boolean; data?: T; error?: string }> {
+    try {
+      const result = await operation();
+      return { success: true, data: result };
+    } catch (error) {
+      logger.error(`Database operation failed [${operationName}]:`, error);
+      
+      if (fallbackValue !== undefined) {
+        return { success: false, data: fallbackValue, error: `${operationName} failed, using fallback` };
+      }
+      
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : `Unknown error in ${operationName}` 
+      };
+    }
+  }
+
+  static async safeTransaction<T>(
+    operations: (() => Promise<void>)[],
+    operationName: string
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      for (const operation of operations) {
+        await operation();
+      }
+      return { success: true };
+    } catch (error) {
+      logger.error(`Transaction failed [${operationName}]:`, error);
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : `Transaction failed in ${operationName}` 
+      };
+    }
+  }
+}
+
+// Free-form deck/team validation. PokemonSkill accepts any user-supplied deck or
+// team name (e.g. "Mewtwo Hyper Offense", "All Psychic"), so this only enforces
+// basic format/length rules — there's no external database to check against.
+class CommanderValidator {
+  static async validateCommander(commanderName: string): Promise<{ valid: boolean; error?: string }> {
+    if (!InputValidator.validateCommanderName(commanderName)) {
+      return { valid: false, error: 'Invalid deck/team name. Use 2–100 letters, digits, spaces, hyphens, apostrophes, commas, or periods.' };
+    }
+    return { valid: true };
+  }
+}
+
+// Enhanced user fetching with error handling
+async function fetchUsernames(
+  client: ExtendedClient, 
+  userIds: string[]
+): Promise<{ userNames: Record<string, string>; failures: string[] }> {
+  const userNames: Record<string, string> = {};
+  const failures: string[] = [];
+
+  // Validate user IDs first
+  const validUserIds = userIds.filter(id => InputValidator.validateUserId(id));
+  const invalidIds = userIds.filter(id => !InputValidator.validateUserId(id));
+  
+  for (const invalidId of invalidIds) {
+    logger.warn(`Invalid user ID format: ${invalidId}`);
+    userNames[invalidId] = `<@${invalidId}>`;
+    failures.push(invalidId);
+  }
+
+  // Batch fetch with rate limiting
+  const fetchPromises = validUserIds.map(async (userId) => {
+    const user = await rateLimiter.fetchUserSafe(client, userId);
+    if (user) {
+      userNames[userId] = `@${user.username}`;
+    } else {
+      userNames[userId] = `<@${userId}>`;
+      failures.push(userId);
+    }
+  });
+
+  await Promise.all(fetchPromises);
+  return { userNames, failures };
+}
+
+async function getNextGameSequence(afterGameId?: string): Promise<{ sequence: number; injectedTimestamp: Date | null }> {
+  try {
+    const { getDatabase } = await import('../db/init.js');
+    const db = getDatabase();
+
+    if (!afterGameId) {
+      const result = await db.get('SELECT MAX(gameSequence) as maxSeq FROM games_master WHERE status = "confirmed" AND active = 1');
+      return { sequence: (result?.maxSeq || 0) + 1.0, injectedTimestamp: null };
+    }
+
+    // Handle special cases "0" and "start" for pre-injection (before all games)
+    if (afterGameId === '0' || afterGameId.toLowerCase() === 'start') {
+      const firstGame = await db.get('SELECT gameSequence, createdAt FROM games_master WHERE status = "confirmed" AND active = 1 ORDER BY gameSequence ASC LIMIT 1');
+      const minSequence = firstGame?.gameSequence || 1.0;
+
+      // Timestamp: 1 hour before the first game
+      let injectedTimestamp: Date;
+      if (firstGame?.createdAt) {
+        injectedTimestamp = new Date(new Date(firstGame.createdAt).getTime() - 60 * 60 * 1000);
+      } else {
+        injectedTimestamp = new Date();
+      }
+      // Round down to nearest minute
+      injectedTimestamp.setSeconds(0, 0);
+
+      return { sequence: minSequence / 2, injectedTimestamp };
+    }
+
+    if (!InputValidator.validateGameId(afterGameId)) {
+      throw new Error(`Invalid game ID format: ${afterGameId}`);
+    }
+
+    const targetGame = await db.get('SELECT gameSequence, createdAt FROM games_master WHERE gameId = ? AND status = "confirmed" AND active = 1', afterGameId);
+    if (!targetGame) {
+      throw new Error(`Game ID "${afterGameId}" not found or is not confirmed`);
+    }
+
+    const nextGame = await db.get(
+      'SELECT MIN(gameSequence) as nextSeq, createdAt FROM games_master WHERE gameSequence > ? AND status = "confirmed"',
+      targetGame.gameSequence
+    );
+
+    const sequence = nextGame?.nextSeq
+      ? (targetGame.gameSequence + nextGame.nextSeq) / 2
+      : targetGame.gameSequence + 1.0;
+
+    // Compute injected timestamp
+    let injectedTimestamp: Date | null;
+    const targetTime = new Date(targetGame.createdAt).getTime();
+
+    if (nextGame?.nextSeq && nextGame.createdAt) {
+      // There IS a game after the reference game: midway point between the two
+      const nextTime = new Date(nextGame.createdAt).getTime();
+      const midpoint = Math.floor((targetTime + nextTime) / 2);
+      injectedTimestamp = new Date(midpoint);
+      // Round down to nearest minute
+      injectedTimestamp.setSeconds(0, 0);
+    } else {
+      // No game after the reference game: this is effectively appending to the end, use "now"
+      injectedTimestamp = null;
+    }
+
+    return { sequence, injectedTimestamp };
+  } catch (error) {
+    logger.error('Error in getNextGameSequence:', error);
+    throw error;
+  }
+}
+
+// Function to store game in games_master table with sequence
+async function storeGameInMaster(gameId: string, gameSequence: number, submittedBy: string, gameType: 'player' | 'deck', submittedByAdmin: boolean, createdAt?: Date): Promise<void> {
+  const { getDatabase } = await import('../db/init.js');
+  const db = getDatabase();
+
+  if (createdAt) {
+    await db.run(`
+      INSERT INTO games_master (gameId, gameSequence, gameType, submittedBy, submittedByAdmin, status, active, createdAt)
+      VALUES (?, ?, ?, ?, ?, 'confirmed', 1, ?)
+    `, [gameId, gameSequence, gameType, submittedBy, submittedByAdmin ? 1 : 0, createdAt.toISOString()]);
+  } else {
+    await db.run(`
+      INSERT INTO games_master (gameId, gameSequence, gameType, submittedBy, submittedByAdmin, status, active)
+      VALUES (?, ?, ?, ?, ?, 'confirmed', 1)
+    `, [gameId, gameSequence, gameType, submittedBy, submittedByAdmin ? 1 : 0]);
+  }
+}
+
+// Clean up database records for an unconfirmed (limbo) game that was cancelled or timed out
+export async function cleanupUnconfirmedGame(gameId: string): Promise<void> {
+  const { getDatabase } = await import('../db/init.js');
+  const db = getDatabase();
+  try {
+    await db.run('DELETE FROM games_master WHERE gameId = ?', gameId);
+    await db.run('DELETE FROM game_ids WHERE gameId = ?', gameId);
+    // Also clean up any match/deck_match records just in case
+    await db.run('DELETE FROM matches WHERE gameId = ?', gameId);
+    await db.run('DELETE FROM deck_matches WHERE gameId = ?', gameId);
+    logger.info(`[CLEANUP] Removed unconfirmed game ${gameId} from database`);
+  } catch (error) {
+    logger.error(`[CLEANUP] Error removing unconfirmed game ${gameId}:`, error);
+  }
+}
+
+// Function to update all match records with game sequence
+async function updateMatchesWithSequence(gameId: string, gameSequence: number, gameType: 'player' | 'deck'): Promise<void> {
+  const { getDatabase } = await import('../db/init.js');
+  const db = getDatabase();
+  
+  if (gameType === 'player') {
+    await db.run('UPDATE matches SET gameSequence = ? WHERE gameId = ?', [gameSequence, gameId]);
+  } else {
+    await db.run('UPDATE deck_matches SET gameSequence = ? WHERE gameId = ?', [gameSequence, gameId]);
+  }
+  await db.run('UPDATE game_ids SET gameSequence = ?, status = "confirmed" WHERE gameId = ?', [gameSequence, gameId]);
+}
+
+// Function to recalculate ALL player ratings from scratch in chronological order
+export async function recalculateAllPlayersFromScratch(): Promise<void> {
+  logger.info('[RECALC] Starting complete player rating recalculation...');
+
+  const { getDatabase } = await import('../db/init.js');
+  const db = getDatabase();
+
+  // Get all players and reset their ratings to defaults (including lastPlayed = null)
+  const allPlayers = await getAllPlayers();
+  for (const player of allPlayers) {
+    await updatePlayerRating(player.userId, 25.0, 8.333, 0, 0, 0);
+    await db.run('UPDATE players SET lastPlayed = NULL WHERE userId = ?', [player.userId]);
+  }
+
+  // Get all ACTIVE games in chronological order with their dates
+  const allGames = await db.all(`
+    SELECT gameId, gameSequence, createdAt
+    FROM games_master
+    WHERE gameType = 'player' AND status = 'confirmed' AND active = 1
+    ORDER BY gameSequence ASC
+  `);
+
+  // Replay each game in order, interleaving decay between games
+  for (const game of allGames) {
+    // Get the players who participate in this game
+    const participants = await db.all('SELECT userId FROM matches WHERE gameId = ?', game.gameId);
+    const participantIds = participants.map((p: any) => p.userId);
+
+    // Apply decay for participants up to this game's date
+    // This ensures their pre-game rating includes accumulated decay from inactivity
+    const gameDate = new Date(game.createdAt);
+    await applyDecayForPlayers(participantIds, gameDate);
+
+    // Replay the game (uses current ratings, which now include decay)
+    await replayPlayerGame(game.gameId);
+
+    // Fix lastPlayed for participants to the game's actual date (not "now")
+    for (const userId of participantIds) {
+      await db.run('UPDATE players SET lastPlayed = ? WHERE userId = ?', [game.createdAt, userId]);
+    }
+  }
+
+  // Apply current-day decay after replaying all games — interleaved decay only covers
+  // gaps between games, not from the last game to today. Without this, inactive players
+  // who haven't played since their last game won't have decay applied.
+  const decayCount = await applyRatingDecay('cron', undefined, 0, true);
+  if (decayCount > 0) {
+    logger.info(`[RECALC] Applied post-recalculation decay to ${decayCount} player(s)`);
+  }
+
+  logger.info(`[RECALC] Completed recalculation of ${allGames.length} player games (with interleaved decay)`);
+}
+
+// Function to recalculate ALL deck ratings from scratch in chronological order
+async function recalculateAllDecksFromScratch(): Promise<void> {
+  logger.info('[RECALC] Starting complete deck rating recalculation...');
+
+  const { getDatabase } = await import('../db/init.js');
+  const db = getDatabase();
+
+  // Get all decks and reset their ratings to defaults
+  const allDecks = await getAllDecks();
+  for (const deck of allDecks) {
+    await updateDeckRating(deck.normalizedName, deck.displayName, 25.0, 8.333, 0, 0, 0);
+  }
+
+  // Get ALL deck-related games (pure deck + hybrid player-commander) interleaved
+  // chronologically by gameSequence. This ensures deck ratings are calculated in the
+  // correct order regardless of game type.
+  const allDeckRelatedGames = await db.all(`
+    SELECT gameId, gameSequence, 'deck' as replayType
+    FROM games_master
+    WHERE gameType = 'deck' AND status = 'confirmed' AND active = 1
+    UNION
+    SELECT DISTINCT gm.gameId, gm.gameSequence, 'hybrid' as replayType
+    FROM games_master gm
+    JOIN matches m ON m.gameId = gm.gameId
+    WHERE gm.gameType = 'player' AND gm.status = 'confirmed' AND gm.active = 1 AND m.assignedDeck IS NOT NULL
+    ORDER BY gameSequence ASC
+  `);
+
+  let pureDeckCount = 0;
+  let hybridCount = 0;
+  for (const game of allDeckRelatedGames) {
+    if (game.replayType === 'deck') {
+      await replayDeckGame(game.gameId);
+      pureDeckCount++;
+    } else {
+      await replayCommanderRatingsForGame(game.gameId);
+      hybridCount++;
+    }
+  }
+
+  logger.info(`[RECALC] Completed recalculation of ${pureDeckCount} pure deck games and ${hybridCount} hybrid player-commander games (interleaved chronologically)`);
+
+  // Re-apply rating decay based on actual lastPlayed dates (skip undo snapshot since
+  // the parent operation handles undo for the entire recalculation)
+  const decayCount = await applyRatingDecay('cron', undefined, 0, true);
+  if (decayCount > 0) {
+    logger.info(`[RECALC] Re-applied rating decay to ${decayCount} player(s) after recalculation`);
+  }
+
+  // Always clean up players and decks with 0/0/0 records after recalculation
+  const playerCleanup = await cleanupZeroPlayers();
+  const deckCleanup = await cleanupZeroDecks();
+  if (playerCleanup.cleanedPlayers > 0 || deckCleanup.cleanedDecks > 0) {
+    logger.info(`[RECALC] Cleaned up ${playerCleanup.cleanedPlayers} player(s) and ${deckCleanup.cleanedDecks} deck(s) with no remaining games`);
+  }
+}
+
+// Function to replay a single player game (exported for use by /set command)
+export async function replayPlayerGame(gameId: string): Promise<void> {
+  const { getDatabase } = await import('../db/init.js');
+  const db = getDatabase();
+  
+  // Get all matches for this game
+  const matches = await db.all('SELECT * FROM matches WHERE gameId = ? ORDER BY matchDate ASC', gameId);
+  
+  if (matches.length === 0) return;
+
+  // Get current ratings for all players in this game
+  const playerRatings: Record<string, any> = {};
+  const playerStats: Record<string, any> = {};
+  
+  for (const match of matches) {
+    const player = await getOrCreatePlayer(match.userId);
+    playerRatings[match.userId] = rating({ mu: player.mu, sigma: player.sigma });
+    playerStats[match.userId] = {
+      wins: player.wins,
+      losses: player.losses,
+      draws: player.draws
+    };
+  }
+
+  // Create ratings array in the same order as matches
+  const gameRatings = matches.map(match => [playerRatings[match.userId]]);
+  
+  // Create ranks array based on match status
+  const statusRank: Record<string, number> = { w: 1, d: 2, l: 3 };
+  const ranks = matches.map(match => statusRank[match.status] || 3);
+
+  // Apply OpenSkill rating update
+  const newRatings = rate(gameRatings, { rank: ranks });
+
+  // Apply 3-player penalty if applicable
+  const penalty = matches.length === 3 ? 0.9 : 1.0;
+
+  // Update each player
+  for (let i = 0; i < matches.length; i++) {
+    const match = matches[i];
+    const newRating = newRatings[i][0];
+    
+    // Apply penalty
+    const finalRating = {
+      mu: 25 + (newRating.mu - 25) * penalty,
+      sigma: newRating.sigma
+    };
+
+    // Apply minimum rating changes
+    const oldRating = playerRatings[match.userId];
+    let adjustedRating = ensureMinimumRatingChange(oldRating, finalRating, match.status);
+
+    // Apply participation bonus (+1 Elo for playing ranked, max 5/day)
+    const matchDate = new Date(match.matchDate);
+    const gamesAlreadyToday = await getPlayerGamesOnDateBefore(match.userId, matchDate, gameId);
+    adjustedRating = applyParticipationBonus(adjustedRating, gamesAlreadyToday);
+
+    // Update win/loss/draw counts
+    const stats = playerStats[match.userId];
+    if (match.status === 'w') stats.wins++;
+    else if (match.status === 'l') stats.losses++;
+    else if (match.status === 'd') stats.draws++;
+
+    // Save to database
+    await updatePlayerRating(
+      match.userId,
+      adjustedRating.mu,
+      adjustedRating.sigma,
+      stats.wins,
+      stats.losses,
+      stats.draws
+    );
+
+    // Update match record with recalculated mu/sigma values
+    await db.run(
+      'UPDATE matches SET mu = ?, sigma = ? WHERE gameId = ? AND userId = ?',
+      [adjustedRating.mu, adjustedRating.sigma, gameId, match.userId]
+    );
+
+    // Log the rating change for audit trail (replay/recalculation)
+    try {
+      await logRatingChange({
+        targetType: 'player',
+        targetId: match.userId,
+        targetDisplayName: `Player ${match.userId}`,
+        changeType: 'game',
+        oldMu: oldRating.mu,
+        oldSigma: oldRating.sigma,
+        oldElo: calculateElo(oldRating.mu, oldRating.sigma),
+        newMu: adjustedRating.mu,
+        newSigma: adjustedRating.sigma,
+        newElo: calculateElo(adjustedRating.mu, adjustedRating.sigma),
+        parameters: JSON.stringify({
+          gameId: gameId,
+          result: match.status,
+          turnOrder: match.turnOrder,
+          recalculation: true,
+          submittedByAdmin: match.submittedByAdmin || false
+        })
+      });
+    } catch (auditError) {
+      logger.error('Error logging player recalculation to audit trail:', auditError);
+    }
+  }
+
+  // Process commander ratings for hybrid games (player games with assigned decks)
+  await replayCommanderRatingsForGame(gameId, matches);
+}
+
+// Replay ONLY the commander/deck ratings for a player game that has assigned decks.
+// This is separated so it can be called independently during deck recalculation.
+export async function replayCommanderRatingsForGame(gameId: string, matches?: any[]): Promise<void> {
+  const { getDatabase } = await import('../db/init.js');
+  const db = getDatabase();
+
+  // If matches weren't passed in, fetch them
+  if (!matches) {
+    matches = await db.all('SELECT * FROM matches WHERE gameId = ? ORDER BY matchDate ASC', gameId);
+  }
+
+  if (!matches || matches.length === 0) return;
+
+  const matchesWithCommanders = matches.filter((m: any) => m.assignedDeck);
+  if (matchesWithCommanders.length === 0) return;
+
+  // Clean up any existing deck_matches for this game before re-creating
+  await db.run('DELETE FROM deck_matches WHERE gameId = ?', gameId);
+
+  const playerEntries: PlayerEntry[] = matchesWithCommanders.map((m: any) => ({
+    userId: m.userId,
+    status: m.status,
+    turnOrder: m.turnOrder,
+    commander: m.assignedDeck,
+    normalizedCommanderName: m.assignedDeck
+  }));
+
+  const allPlayerEntries: PlayerEntry[] = matches.map((m: any) => ({
+    userId: m.userId,
+    status: m.status,
+    turnOrder: m.turnOrder,
+    commander: m.assignedDeck || undefined,
+    normalizedCommanderName: m.assignedDeck || undefined
+  }));
+
+  await processCommanderRatingsEnhanced(playerEntries, allPlayerEntries, gameId, `${gameId}-replay`);
+}
+
+// Function to replay a single deck game (exported for use by /set command)
+export async function replayDeckGame(gameId: string): Promise<void> {
+  const { getDatabase } = await import('../db/init.js');
+  const db = getDatabase();
+  
+  // Get all deck matches for this game
+  const matches = await db.all('SELECT * FROM deck_matches WHERE gameId = ? ORDER BY matchDate ASC', gameId);
+  
+  if (matches.length === 0) return;
+
+  // Get current ratings for all UNIQUE decks in this game
+  const uniqueDecks = new Set<string>(matches.map((m: any) => m.deckNormalizedName));
+  const deckRatings: Record<string, any> = {};
+  const deckStats: Record<string, any> = {};
+
+  for (const deckName of uniqueDecks) {
+    const match = matches.find((m: any) => m.deckNormalizedName === deckName);
+    const deck = await getOrCreateDeck(deckName, match.deckDisplayName);
+    deckRatings[deckName] = rating({ mu: deck.mu, sigma: deck.sigma });
+    deckStats[deckName] = {
+      wins: deck.wins,
+      losses: deck.losses,
+      draws: deck.draws,
+      displayName: deck.displayName
+    };
+  }
+
+  // Create per-instance rating copies to avoid shared references for duplicate decks
+  const gameRatings = matches.map(match => {
+    const r = deckRatings[match.deckNormalizedName];
+    return [rating({ mu: r.mu, sigma: r.sigma })]; // Fresh copy per instance
+  });
+
+  // Create ranks array based on match status
+  const statusRank: Record<string, number> = { w: 1, d: 2, l: 3 };
+  const ranks = matches.map(match => statusRank[match.status] || 3);
+
+  // Apply OpenSkill rating update
+  const newRatings = rate(gameRatings, { rank: ranks });
+
+  // Apply 3-deck penalty if applicable
+  const penalty = matches.length === 3 ? 0.9 : 1.0;
+
+  // Process results and aggregate changes for duplicate decks
+  const deckChanges: Record<string, { instanceRatings: any[], statusUpdates: string[] }> = {};
+
+  for (let i = 0; i < matches.length; i++) {
+    const match = matches[i];
+    const newRating = newRatings[i][0];
+
+    // Apply penalty
+    const finalRating = {
+      mu: 25 + (newRating.mu - 25) * penalty,
+      sigma: newRating.sigma
+    };
+
+    if (!deckChanges[match.deckNormalizedName]) {
+      deckChanges[match.deckNormalizedName] = {
+        instanceRatings: [],
+        statusUpdates: []
+      };
+    }
+
+    // Track status updates for this deck
+    deckChanges[match.deckNormalizedName].statusUpdates.push(match.status);
+    deckChanges[match.deckNormalizedName].instanceRatings.push(finalRating);
+  }
+
+  // Apply aggregated changes to each unique deck
+  for (const [deckName, changes] of Object.entries(deckChanges)) {
+    const stats = deckStats[deckName];
+
+    // For duplicates, average mu and take min sigma
+    let aggregatedRating: any;
+    if (changes.instanceRatings.length === 1) {
+      aggregatedRating = changes.instanceRatings[0];
+    } else {
+      const avgMu = changes.instanceRatings.reduce((sum: number, r: any) => sum + r.mu, 0) / changes.instanceRatings.length;
+      const minSigma = Math.min(...changes.instanceRatings.map((r: any) => r.sigma));
+      aggregatedRating = { mu: avgMu, sigma: minSigma };
+    }
+
+    // Apply participation bonus (+1 Elo for playing ranked, max 5/day)
+    const firstDeckMatch = matches.find((m: any) => m.deckNormalizedName === deckName);
+    const deckMatchDate = new Date(firstDeckMatch?.matchDate || new Date());
+    const deckGamesToday = await getDeckGamesOnDateBefore(deckName, deckMatchDate, gameId);
+    const bonusedRating = applyParticipationBonus(aggregatedRating, deckGamesToday);
+
+    // Count total wins/losses/draws for this deck in this game
+    for (const status of changes.statusUpdates) {
+      if (status === 'w') stats.wins++;
+      else if (status === 'l') stats.losses++;
+      else if (status === 'd') stats.draws++;
+    }
+
+    // Save to database
+    await updateDeckRating(
+      deckName,
+      stats.displayName,
+      bonusedRating.mu,
+      bonusedRating.sigma,
+      stats.wins,
+      stats.losses,
+      stats.draws
+    );
+
+    // Update all deck_match records for this deck with recalculated mu/sigma
+    await db.run(
+      'UPDATE deck_matches SET mu = ?, sigma = ? WHERE gameId = ? AND deckNormalizedName = ?',
+      [bonusedRating.mu, bonusedRating.sigma, gameId, deckName]
+    );
+
+    // Log the deck rating change for audit trail (replay/recalculation)
+    try {
+      await logRatingChange({
+        targetType: 'deck',
+        targetId: deckName,
+        targetDisplayName: stats.displayName,
+        changeType: 'game',
+        oldMu: deckRatings[deckName].mu,
+        oldSigma: deckRatings[deckName].sigma,
+        oldElo: calculateElo(deckRatings[deckName].mu, deckRatings[deckName].sigma),
+        newMu: bonusedRating.mu,
+        newSigma: bonusedRating.sigma,
+        newElo: calculateElo(bonusedRating.mu, bonusedRating.sigma),
+        parameters: JSON.stringify({
+          gameId: gameId,
+          duplicateCount: changes.statusUpdates.length,
+          results: changes.statusUpdates,
+          recalculation: true,
+          is3DeckPenalty: matches.length === 3,
+          participationBonus: PARTICIPATION_BONUS_ELO
+        })
+      });
+    } catch (auditError) {
+      logger.error('Error logging deck recalculation to audit trail:', auditError);
+    }
+  }
+}
+
+// Helper function to rebuild turn order data from current reactions
+async function buildTurnOrderFromReactions(message: any, players: PlayerEntry[]): Promise<Map<string, number>> {
+  const turnOrderData = new Map<string, number>();
+  const turnOrderEmojis = ['1️⃣', '2️⃣'];
+  const validUserIds = new Set(players.map(p => p.userId));
+  
+  try {
+    const freshMessage = await message.fetch();
+    
+    for (const [emojiName, reaction] of freshMessage.reactions.cache) {
+      if (turnOrderEmojis.includes(emojiName)) {
+        const turnOrder = turnOrderEmojis.indexOf(emojiName) + 1;
+        const users = await reaction.users.fetch();
+        
+        for (const [userId, user] of users) {
+          if (user.bot) continue;
+          if (!validUserIds.has(userId)) continue;
+          
+          const playerHasTurnOrder = players.find(p => p.userId === userId)?.turnOrder !== undefined;
+          if (playerHasTurnOrder) continue;
+          
+          const isAlreadyTaken = Array.from(turnOrderData.values()).includes(turnOrder);
+          if (isAlreadyTaken) continue;
+          
+          turnOrderData.set(userId, turnOrder);
+          break;
+        }
+      }
+    }
+  } catch (error) {
+    logger.error('Error rebuilding turn order from reactions:', error);
+  }
+  
+  return turnOrderData;
+}
+
+// Show top 50 players and decks after major operations
+async function showTop50PlayersAndDecks(interaction: ChatInputCommandInteraction): Promise<void> {
+  // Players
+  const allPlayers = await getAllPlayers();
+  const { getRestrictedPlayers } = await import('../db/player-utils.js');
+  const restricted = new Set(await getRestrictedPlayers());
+  
+  const filteredPlayers = allPlayers.filter((p: any) => {
+    if (restricted.has(p.userId)) return false;
+    const totalGames = (p.wins || 0) + (p.losses || 0) + (p.draws || 0);
+    return totalGames > 0;
+  });
+
+  const rankedPlayers = filteredPlayers
+    .map((p: any) => ({
+      id: p.userId,
+      elo: calculateElo(p.mu, p.sigma),
+      totalGames: (p.wins || 0) + (p.losses || 0) + (p.draws || 0)
+    }))
+    .sort((a: any, b: any) => b.elo - a.elo)
+    .slice(0, 50);
+
+  // Decks
+  const allDecks = await getAllDecks();
+  
+  const filteredDecks = allDecks.filter((d: any) => {
+    const totalGames = (d.wins || 0) + (d.losses || 0) + (d.draws || 0);
+    return totalGames > 0;
+  });
+
+  const rankedDecks = filteredDecks
+    .map((d: any) => ({
+      normalizedName: d.normalizedName,
+      displayName: d.displayName,
+      elo: calculateElo(d.mu, d.sigma),
+      totalGames: (d.wins || 0) + (d.losses || 0) + (d.draws || 0)
+    }))
+    .sort((a: any, b: any) => b.elo - a.elo)
+    .slice(0, 50);
+
+  // Player description
+  const playerDescription: string[] = [];
+  let currentPlayerRank = 1;
+
+  for (let i = 0; i < rankedPlayers.length; i++) {
+    const player = rankedPlayers[i];
+    
+    if (i > 0 && player.elo !== rankedPlayers[i - 1].elo) {
+      currentPlayerRank = i + 1;
+    }
+
+    let playerDisplay: string;
+    try {
+      const user = await interaction.client.users.fetch(player.id);
+      playerDisplay = `@${user.username}`;
+    } catch {
+      playerDisplay = `<@${player.id}>`;
+    }
+    
+    playerDescription.push(`RANK${currentPlayerRank}/POS${i + 1}. ${playerDisplay} - **${player.elo}** Elo`);
+  }
+
+  // Deck description
+  const deckDescription = rankedDecks.map((deck: any, index: number) => {
+    return `${index + 1}. **${deck.displayName}** - **${deck.elo}** Elo`;
+  });
+
+  const playerEmbed = new EmbedBuilder()
+    .setTitle('🏆 Updated Top 50 Players')
+    .setDescription(playerDescription.length > 0 ? playerDescription.join('\n') : 'No players found.')
+    .setColor('Gold')
+    .setFooter({ text: 'Player rankings updated after game injection/recalculation' });
+
+  const deckEmbed = new EmbedBuilder()
+    .setTitle('🃃 Updated Top 50 Decks/Teams')
+    .setDescription(deckDescription.length > 0 ? deckDescription.join('\n') : 'No decks found.')
+    .setColor('Purple')
+    .setFooter({ text: 'Deck rankings updated after game injection/recalculation' });
+
+  await interaction.followUp({ embeds: [playerEmbed, deckEmbed] });
+}
+
+// Helper function to update match turn orders after the fact
+async function updateMatchTurnOrders(matchId: string, turnOrderSelections: Map<string, number>): Promise<void> {
+  for (const [userId, turnOrder] of turnOrderSelections) {
+    if (turnOrder > 0) {
+      await updateMatchTurnOrder(matchId, userId, turnOrder);
+    }
+  }
+}
+
+// Ensure minimum rating changes (always +2 for winners, always -2 for losers)
+function ensureMinimumRatingChange(oldRating: Rating, newRating: Rating, status: string): Rating {
+  const oldElo = calculateElo(oldRating.mu, oldRating.sigma);
+  const newElo = calculateElo(newRating.mu, newRating.sigma);
+  const actualChange = newElo - oldElo;
+
+  if (status === 'w') {
+    // Winners must gain at least 2 points, always
+    if (actualChange < 2) {
+      const targetElo = oldElo + 2;
+      const targetMu = muFromElo(targetElo, newRating.sigma);
+      return { mu: targetMu, sigma: newRating.sigma };
+    }
+  } else if (status === 'l') {
+    // Losers must lose at least 2 points, always
+    if (actualChange > -2) {
+      const targetElo = oldElo - 2;
+      const targetMu = muFromElo(targetElo, newRating.sigma);
+      return { mu: targetMu, sigma: newRating.sigma };
+    }
+  }
+  // Draw players (status === 'd') can have any rating change
+
+  return newRating;
+}
+
+/**
+ * Apply participation bonus (+1 Elo) to a rating.
+ * This is applied AFTER all other calculations as a reward for playing ranked.
+ * Limited to MAX_DAILY_PARTICIPATION_BONUS games per day per entity.
+ * @param gamesAlreadyToday - number of games already played today before this game
+ */
+function applyParticipationBonus(rating: Rating, gamesAlreadyToday: number = 0): Rating {
+  if (gamesAlreadyToday >= MAX_DAILY_PARTICIPATION_BONUS) {
+    return rating;
+  }
+  const currentElo = calculateElo(rating.mu, rating.sigma);
+  const bonusElo = currentElo + PARTICIPATION_BONUS_ELO;
+  const newMu = muFromElo(bonusElo, rating.sigma);
+  return { mu: newMu, sigma: rating.sigma };
+}
+
+// Suspicious activity detection, admin games skipped entirely
+async function checkForSuspiciousPatterns(
+  userId: string,
+  submittedByAdmin: boolean
+): Promise<string | null> {
+  if (submittedByAdmin) return null;
+  if (await isExempt(userId)) return null;
+  const recent = await getRecentMatches(userId, 50);
+  const now = Date.now();
+
+  // 1) Win streak in last 10 non-admin games (changed from 5 in 7 to 8 in 10)
+const nonAdminMatches = recent.filter(m => !m.submittedByAdmin);
+const last10 = nonAdminMatches.slice(0, 10);
+const winSet = new Set<string>();
+for (const m of last10) {
+  if (m.status === 'w') {
+    winSet.add(m.id);
+  }
+}
+if (winSet.size >= 8) {
+  return `⚠️ Suspicious activity detected: <@${userId}> has won ${winSet.size} of their last 10 non-admin matches.`;
+}
+
+// 2) Submitting many wins in a short time (4 wins in 30 min) - FIXED
+const submitterMap: Record<string, { timestamp: number; winnerId: string }[]> = {};
+for (const m of recent) {
+  if (!m.submittedByAdmin) { // Only count non-admin games
+    const t = new Date(m.matchDate || m.timestamp).getTime();
+    const submitterId = m.submitterId || m.userId;
+    submitterMap[submitterId] = submitterMap[submitterId] || [];
+    submitterMap[submitterId].push({ timestamp: t, winnerId: m.userId });
+  }
+}
+for (const [submitter, entries] of Object.entries(submitterMap)) {
+  const windowEntries = entries.filter(e => now - e.timestamp <= 30 * 60 * 1000);
+  // Now windowEntries only contains non-admin games, so this check is correct
+  const countByWinner: Record<string, number> = {};
+  for (const e of windowEntries) {
+    countByWinner[e.winnerId] = (countByWinner[e.winnerId] || 0) + 1;
+  }
+  for (const [winner, count] of Object.entries(countByWinner)) {
+    if (count >= 4) {
+      return `⚠️ Suspicious activity detected: <@${submitter}> has submitted ${count} matches involving <@${winner}> in the last 30 minutes.`;
+    }
+  }
+}
+
+// 3) Repeated opponents: >=9 wins against same group
+// Query actual opponents from the database using gameId (teams/scores fields are not populated)
+const wonGameIds: string[] = [];
+for (const m of recent) {
+  if (m.status === 'w' && !m.submittedByAdmin) {
+    wonGameIds.push(m.gameId);
+  }
+}
+if (wonGameIds.length >= 9) {
+  const opponentsByGame = await getOpponentsByGameIds(wonGameIds, userId);
+  const groupCountMap: Record<string, number> = {};
+  for (const gameId of wonGameIds) {
+    const opponents = opponentsByGame[gameId] || [];
+    const key = JSON.stringify(opponents);
+    groupCountMap[key] = (groupCountMap[key] || 0) + 1;
+  }
+  for (const [key, count] of Object.entries(groupCountMap)) {
+    if (count >= 9) {
+      return `⚠️ Suspicious activity detected: <@${userId}> has won ${count} matches against the same group.`;
+    }
+  }
+}
+
+  return null;
+}
+
+type PlayerEntry = {
+  userId: string;
+  team?: string;
+  score?: number;
+  status?: string;
+  place?: number;
+  turnOrder?: number;
+  commander?: string;
+  normalizedCommanderName?: string;
+};
+
+type DeckEntry = {
+  commander: string;
+  normalizedName: string;
+  status: 'w' | 'l' | 'd';
+  turnOrder: number;
+};
+
+export const data = new SlashCommandBuilder()
+  .setName('rank')
+  .setDescription('Submit a 1v1 game result — players, decks/teams, or both!')
+  .addStringOption(option =>
+    option
+      .setName('results')
+      .setDescription('Results string - can include @users and/or deck/team names with w/l/d')
+      .setRequired(true)
+  )
+  .addStringOption(option =>
+    option
+      .setName('aftergame')
+      .setDescription('Admin only: Inject this game after specified game ID. Use "start" or "0" to place before all games')
+      .setRequired(false)
+  );
+
+export async function execute(
+  interaction: ChatInputCommandInteraction,
+  client: ExtendedClient
+): Promise<void> {
+  const input = interaction.options.getString('results', true);
+  const afterGameId = interaction.options.getString('aftergame');
+
+  // Defer immediately to prevent interaction timeout
+  await interaction.deferReply();
+
+  // Check if user is admin for aftergame parameter
+  if (afterGameId && !config.admins.includes(interaction.user.id)) {
+    await interaction.editReply({
+      content: 'Only admins can inject games using the `aftergame` parameter.'
+    });
+    return;
+  }
+
+  // Check for deck-only mode (no user mentions at all)
+  const hasUserMentions = /<@!?\d+>/.test(input);
+
+  if (!hasUserMentions) {
+    // No user mentions found - this is deck-only mode
+    await executeDeckOnlyMode(interaction, client, input, afterGameId);
+    return;
+  }
+
+  // If we get here, there are user mentions, so extract user IDs for validation
+  const mentionMatches = input.match(/<@!?\d+>/g);
+  const userIds = mentionMatches!.map(t => t.replace(/\D/g, ''));
+
+  // Check for restricted players
+  for (const id of userIds) {
+    if (await isPlayerRestricted(id)) {
+      await interaction.editReply({
+        content: `🚫 <@${id}> is restricted from ranked games and cannot be included.`
+      });
+      return;
+    }
+  }
+
+// Enhanced parsing to handle commanders assigned to players
+const players: PlayerEntry[] = [];
+
+// Helper function to extract and validate turn order + status combinations
+function parseStatusAndTurnOrder(token: string): { status?: string; turnOrder?: number } | null {
+  // Handle combined formats like "2w", "w2", etc.
+  if (/^[1-4][wld]$/i.test(token)) {
+    // Format: "2w", "3l", "1d"
+    const turnOrder = parseInt(token.charAt(0));
+    const status = token.charAt(1).toLowerCase();
+    return { status, turnOrder };
+  }
+  
+  if (/^[wld][1-4]$/i.test(token)) {
+    // Format: "w2", "l3", "d1"
+    const status = token.charAt(0).toLowerCase();
+    const turnOrder = parseInt(token.charAt(1));
+    return { status, turnOrder };
+  }
+  
+  // Invalid combinations - explicitly reject
+  if (/^\d+[wld]\d+$/i.test(token) || // "2w1", "1l3"
+      /^[wld]+$/i.test(token) && token.length > 1 || // "ww", "lll"
+      /^\d+$/i.test(token) && (parseInt(token) < 1 || parseInt(token) > 4)) { // "0", "5", "99"
+    return null; // Explicitly invalid
+  }
+  
+  // Single status
+  if (/^[wld]$/i.test(token)) {
+    return { status: token.toLowerCase() };
+  }
+  
+  // Single valid turn order
+  if (/^[1-4]$/.test(token)) {
+    return { turnOrder: parseInt(token) };
+  }
+  
+  return null;
+}
+
+// Simple token-by-token parsing approach
+const tokens = input.trim().split(/\s+/);
+let current: PlayerEntry | null = null;
+
+for (let i = 0; i < tokens.length; i++) {
+  const token = tokens[i];
+  
+  if (/^<@!?\d+>$/.test(token)) {
+    // Save previous player if complete
+    if (current && current.status) {
+      players.push(current);
+    }
+    
+    // Start new player
+    current = { userId: token.replace(/\D/g, '') };
+    
+  } else if (current) {
+    // We have a current player, process this token
+    
+    // First, try to parse as status/turn order combination
+    const parsed = parseStatusAndTurnOrder(token);
+    if (parsed !== null) {
+      if (parsed.status) current.status = parsed.status;
+      if (parsed.turnOrder) current.turnOrder = parsed.turnOrder;
+      continue;
+    }
+    
+    // Check if it's a deck/team name (supports multi-word names like "Mewtwo Hyper Offense")
+    if (/^[a-zA-Z][a-zA-Z0-9\-',.]*$/.test(token) && token.length > 1 && !current.commander) {
+      // Make sure it's not another user mention coming up
+      const nextToken = tokens[i + 1];
+      const isFollowedByMention = nextToken && /^<@!?\d+>$/.test(nextToken);
+
+      if (!isFollowedByMention) {
+        // Collect multi-word commander names by looking ahead
+        const commanderParts = [token];
+        let j = i + 1;
+
+        while (j < tokens.length) {
+          const nextT = tokens[j];
+          // Stop if next token is a mention
+          if (/^<@!?\d+>$/.test(nextT)) break;
+          // Stop if next token is a status or turn order
+          if (parseStatusAndTurnOrder(nextT) !== null) break;
+          // Check if it looks like part of a name
+          if (/^[a-zA-Z][a-zA-Z0-9\-',.]*$/.test(nextT) && nextT.length > 1) {
+            commanderParts.push(nextT);
+            j++;
+          } else {
+            break;
+          }
+        }
+
+        current.commander = commanderParts.join(' ');
+        current.normalizedCommanderName = normalizeCommanderName(current.commander);
+        i = j - 1; // Skip past consumed tokens (loop will increment)
+      }
+    }
+    
+  } else {
+    // No current player - check for commander-before-mention pattern
+    if (/^[a-zA-Z][a-zA-Z0-9\-',.]*$/.test(token) && token.length > 1) {
+      // Look ahead for a user mention in the next few tokens
+      for (let j = i + 1; j < Math.min(i + 4, tokens.length); j++) {
+        if (/^<@!?\d+>$/.test(tokens[j])) {
+          // Found a mention - this token is probably a commander name
+          // We'll process the mention when we get to it
+          break;
+        }
+      }
+    }
+  }
+}
+
+// CRITICAL FIX: Validate that each player has AT MOST one commander assignment
+const playerCommanderCount = new Map<string, number>();
+for (const player of players) {
+  if (player.commander) {
+    const count = (playerCommanderCount.get(player.userId) || 0) + 1;
+    playerCommanderCount.set(player.userId, count);
+  }
+}
+
+// Check for players with multiple commanders
+const playersWithMultipleCommanders = Array.from(playerCommanderCount.entries())
+  .filter(([_, count]) => count > 1);
+
+if (playersWithMultipleCommanders.length > 0) {
+  const problematicPlayers = playersWithMultipleCommanders
+    .map(([userId]) => `<@${userId}>`)
+    .join(', ');
+  
+  await interaction.editReply({
+    content: `⚠️ Invalid format: Each player can only have ONE deck/team assigned per game.\n` +
+             `The following players have multiple deck/team names: ${problematicPlayers}\n\n` +
+             `Correct format: \`@user deck-name w\` or \`@user w deck-name\`\n` +
+             `Incorrect format: \`@user deck1 deck2 w\` or \`@user deck1 w deck2\``
+  });
+  return;
+}
+
+// Don't forget the last player
+if (current && current.status) {
+  players.push(current);
+}
+
+// Handle commander-before-mention pattern: "Ashling, Flame Dancer @user w"
+// Look backward from each mention to collect multi-word commander names
+for (let i = 0; i < tokens.length; i++) {
+  if (/^<@!?\d+>$/.test(tokens[i])) {
+    const userId = tokens[i].replace(/\D/g, '');
+    const player = players.find(p => p.userId === userId);
+
+    if (player && !player.commander) {
+      // Look backwards for consecutive commander name tokens
+      const commanderParts: string[] = [];
+      for (let j = i - 1; j >= 0; j--) {
+        const prevToken = tokens[j];
+        // Stop at mentions, status/turn-order tokens, or non-name tokens
+        if (/^<@!?\d+>$/.test(prevToken)) break;
+        if (parseStatusAndTurnOrder(prevToken) !== null) break;
+        if (/^[a-zA-Z][a-zA-Z0-9\-',.]*$/.test(prevToken) && prevToken.length > 1) {
+          commanderParts.unshift(prevToken);
+        } else {
+          break;
+        }
+      }
+
+      if (commanderParts.length > 0) {
+        player.commander = commanderParts.join(' ');
+        player.normalizedCommanderName = normalizeCommanderName(player.commander);
+      }
+    }
+  }
+}
+
+// Validation: Check for invalid combinations and provide helpful error messages
+const invalidPlayers = players.filter(p => !p.status);
+if (invalidPlayers.length > 0) {
+  await interaction.editReply({
+    content: '⚠️ Invalid format detected. Each player must have exactly one result (w/l/d) and optionally one turn order (1-4).\n' +
+             'Valid formats: `@user w`, `@user 2 w`, `@user w 3`, `@user 2w`, `@user w2`\n' +
+             'Invalid formats: `@user 2w1`, `@user ww`, `@user 5w`, `@user 0l`'
+  });
+  return;
+}
+
+// Check for duplicate turn orders
+const assignedTurnOrders = players
+  .filter(p => p.turnOrder !== undefined)
+  .map(p => p.turnOrder!);
+
+const uniqueTurnOrders = new Set(assignedTurnOrders);
+if (assignedTurnOrders.length !== uniqueTurnOrders.size) {
+  await interaction.editReply({
+    content: '⚠️ Duplicate turn orders detected. Each player must have a unique turn order between 1-4.'
+  });
+  return;
+}
+
+// Debug output
+logger.info('Input tokens:', tokens);
+logger.info('Parsed players:', players.map(p => ({
+  userId: p.userId,
+  status: p.status,
+  turnOrder: p.turnOrder,
+  commander: p.commander
+})));
+
+// Check for any parsing failures and reject invalid tokens
+const processedTokens = new Set();
+for (let i = 0; i < tokens.length; i++) {
+  const token = tokens[i];
+  
+  // Skip user mentions and valid commanders
+  if (/^<@!?\d+>$/.test(token) || 
+      (/^[a-zA-Z][a-zA-Z0-9\-',.]*$/.test(token) && token.length > 1)) {
+    continue;
+  }
+  
+  // Check if this token was successfully parsed
+  const parsed = parseStatusAndTurnOrder(token);
+  if (parsed === null && !processedTokens.has(token)) {
+    await interaction.editReply({
+      content: `⚠️ Invalid token detected: "${token}"\n` +
+               'Only use: user mentions (@user), deck/team names, results (w/l/d), and turn orders (1-2).\n' +
+               'Valid examples: `w`, `2`, `1w`, `l2`, but NOT `0w`, `3l`, `ww`, `1w2`'
+    });
+    return;
+  }
+}
+
+  // SMART TURN ORDER DEDUCTION (1v1): if exactly one of two players supplied a
+  // turn order, assign the remaining slot (1 or 2) to the other player.
+  const playersWithTurnOrder = players.filter(p => p.turnOrder !== undefined);
+  if (playersWithTurnOrder.length === 1 && players.length === 2) {
+    const provided = playersWithTurnOrder[0].turnOrder!;
+    const missingTurnOrder = provided === 1 ? 2 : 1;
+    const playerWithoutTurnOrder = players.find(p => p.turnOrder === undefined);
+    if (playerWithoutTurnOrder) {
+      playerWithoutTurnOrder.turnOrder = missingTurnOrder;
+    }
+  }
+
+  if (players.length < 2) {
+    await interaction.editReply({
+      content: '⚠️ You must enter at least two players with results.'
+    });
+    return;
+  }
+
+  // --- POKÉMON 1v1 MODE: enforce exactly 2 players, only w/l/d, optional turn order ---
+  const numPlayers = players.length;
+  const isCEDHMode = true; // Retained internal flag name; controls 1v1-mode restrictions.
+
+  if (isCEDHMode) {
+    if (numPlayers !== 2) {
+      await interaction.editReply({
+        content: '⚠️ PokemonSkill only supports 1v1 (2-player) games.'
+      });
+      return;
+    }
+
+    // Prevent duplicate users
+    const playerIds = players.map(p => p.userId);
+    const uniqueIds = new Set(playerIds);
+    if (uniqueIds.size !== playerIds.length) {
+      await interaction.editReply({
+        content: '⚠️ Duplicate players detected: please list each player only once.'
+      });
+      return;
+    }
+
+    // Ensure each player has w, l, or d
+    if (players.some(p => !['w', 'l', 'd'].includes(p.status ?? ''))) {
+      await interaction.editReply({
+        content: '⚠️ Invalid input: each player must have a result of w (win), l (loss), or d (draw).'
+      });
+      return;
+    }
+
+    // Validate turn order numbers (if provided): 1 = went first, 2 = went second.
+    const providedTurnOrders = players
+      .filter(p => p.turnOrder !== undefined)
+      .map(p => p.turnOrder!);
+
+    if (providedTurnOrders.length > 0) {
+      if (providedTurnOrders.some(t => t < 1 || t > 2)) {
+        await interaction.editReply({
+          content: '⚠️ Turn order must be 1 (went first) or 2 (went second).'
+        });
+        return;
+      }
+
+      const uniqueTurnOrders = new Set(providedTurnOrders);
+      if (uniqueTurnOrders.size !== providedTurnOrders.length) {
+        await interaction.editReply({
+          content: '⚠️ Duplicate turn order numbers detected. Each player must have a unique turn order.'
+        });
+        return;
+      }
+    }
+
+    const winCount = players.filter(p => p.status === 'w').length;
+    const drawCount = players.filter(p => p.status === 'd').length;
+    const lossCount = players.filter(p => p.status === 'l').length;
+
+    // Three legal outcomes for 1v1: P1 wins / P2 wins / draw.
+    if (winCount === 1 && lossCount === 1 && drawCount === 0) {
+      // Valid: one winner, one loser
+    } else if (winCount === 0 && lossCount === 0 && drawCount === 2) {
+      // Valid: draw (both players)
+    } else {
+      await interaction.editReply({
+        content: '⚠️ Invalid result combination for 1v1 format. Must be either: 1 winner + 1 loser, or 2 draws.'
+      });
+      return;
+    }
+  }
+
+  // Free-form deck/team name validation (no external lookup).
+  const playersWithCommanders = players.filter(p => p.commander);
+  if (playersWithCommanders.length > 0) {
+    const uniqueCommanders = [...new Set(playersWithCommanders.map(p => p.normalizedCommanderName!))];
+
+    const validationResults = await Promise.all(
+      uniqueCommanders.map(async (normalizedName) => ({
+        normalizedName,
+        valid: (await CommanderValidator.validateCommander(normalizedName)).valid
+      }))
+    );
+
+    const invalidDecks = validationResults.filter(r => !r.valid);
+    if (invalidDecks.length > 0) {
+      const invalidNames = invalidDecks.map(r =>
+        playersWithCommanders.find(p => p.normalizedCommanderName === r.normalizedName)?.commander
+      ).filter(Boolean).join(', ');
+
+      await interaction.editReply({
+        content: `⚠️ Invalid deck/team name format: ${invalidNames}\n` +
+                 'Names must be 2–100 characters using letters, digits, spaces, hyphens, apostrophes, commas, or periods.'
+      });
+      return;
+    }
+  }
+
+  // Admin check
+  const isAdmin = hasModAccess(interaction.user.id);
+  const submittedByAdmin = isAdmin;
+
+  // Generate unique game ID
+  const gameId = await generateUniqueGameId();
+  await recordGameId(gameId, 'player');
+
+  // Get game sequence number (for injection or regular)
+  let gameSequence: number;
+  let injectedTimestamp: Date | null = null;
+  try {
+    const seqResult = await getNextGameSequence(afterGameId || undefined);
+    gameSequence = seqResult.sequence;
+    injectedTimestamp = seqResult.injectedTimestamp;
+  } catch (error) {
+    await interaction.editReply({
+      content: `⚠️ Error: ${(error as Error).message}`
+    });
+    return;
+  }
+
+  // Use the injected timestamp for backdated games, or current time for regular games
+  const gameDate = injectedTimestamp || new Date();
+
+  // Store game in master table (with backdated timestamp if injecting)
+  await storeGameInMaster(gameId, gameSequence, interaction.user.id, 'player', submittedByAdmin, injectedTimestamp || undefined);
+
+  // Pre-fetch usernames, ratings, and records
+  const userNames: Record<string, string> = {};
+  const preRatings: Record<string, Rating> = {};
+  const records: Record<string, { wins: number; losses: number; draws: number; lastPlayed: string | null }> = {};
+  for (const p of players) {
+  try {
+    const u = await client.users.fetch(p.userId);
+    userNames[p.userId] = `@${u.username}`;
+  } catch (error) {
+    logger.warn(`Failed to fetch username for ${p.userId}:`, error);
+    userNames[p.userId] = `<@${p.userId}>`;
+  }
+  
+  try {
+    const pd = await getOrCreatePlayer(p.userId);
+    preRatings[p.userId] = rating({ mu: pd.mu, sigma: pd.sigma });
+    records[p.userId] = {
+      wins: pd.wins || 0,
+      losses: pd.losses || 0,
+      draws: pd.draws || 0,
+      lastPlayed: pd.lastPlayed || null
+    };
+  } catch (error) {
+    logger.error(`Failed to get player data for ${p.userId}:`, error);
+    // Use defaults if database fails
+    preRatings[p.userId] = rating({ mu: 25.0, sigma: 8.333 });
+    records[p.userId] = { wins: 0, losses: 0, draws: 0, lastPlayed: null };
+  }
+}
+
+  // TURN ORDER SUMMARY
+  const turnOrderSummary = players
+    .filter(p => p.turnOrder !== undefined)
+    .map(p => {
+      const displayName = userNames[p.userId];
+      return `${displayName}: Turn ${p.turnOrder}`;
+    });
+
+  // COMMANDER SUMMARY
+  const commanderSummary = players
+    .filter(p => p.commander)
+    .map(p => {
+      const displayName = userNames[p.userId];
+      return `${displayName}: ${p.commander}`;
+    });
+
+  // Add turn order and commander confirmation to embed description
+  let additionalInfo = '';
+  if (turnOrderSummary.length > 0) {
+    additionalInfo += `\n\n🔢 **Turn Order Assigned:**\n${turnOrderSummary.join('\n')}`;
+  }
+  if (commanderSummary.length > 0) {
+    additionalInfo += `\n\n🃃 **Decks/Teams Assigned:**\n${commanderSummary.join('\n')}`;
+  }
+
+  // CHECK FOR PLAYERS ALREADY IN LIMBO (skip bot)
+  if (!isAdmin) {
+    const playersInLimbo: string[] = [];
+    const allRelevantUsers = new Set([...players.map(p => p.userId), interaction.user.id]);
+    
+    // Remove the bot's user ID if it's in the relevant users
+    if (client.user?.id) {
+      allRelevantUsers.delete(client.user.id);
+    }
+    
+    for (const [messageId, limboData] of client.limboGames) {
+      for (const userId of allRelevantUsers) {
+        if (limboData.players.has(userId)) {
+          playersInLimbo.push(userId);
+        }
+      }
+    }
+    
+    if (playersInLimbo.length > 0) {
+      const conflictingMentions = [...new Set(playersInLimbo)].map(id => `<@${id}>`).join(', ');
+      await interaction.editReply({
+        content: `⚠️ Cannot submit game results. The following players are already in unconfirmed games: ${conflictingMentions}\n\nPlease wait for their current games to be confirmed before submitting new results.`
+      });
+      return;
+    }
+  }
+
+  const injectionNote = afterGameId 
+  ? afterGameId === '0' 
+    ? `\n\n🔥 **Game Pre-Injection**: This game will be placed BEFORE all existing games and all ratings will be recalculated.`
+    : `\n\n🔥 **Game Injection**: This game will be inserted after game "${afterGameId}" and all ratings will be recalculated.`
+  : '';
+
+  if (submittedByAdmin) {
+  // Create admin-specific embed
+  const adminEmbed = new EmbedBuilder()
+    .setTitle(`⚔️ Game Results Auto Confirmed`)
+    .setDescription(
+      `✅ **Results submitted by admin. Ratings have been updated immediately.**\n\n` +
+      `🎯 **Game ID: ${gameId}**${injectionNote}${additionalInfo}\n\n` +
+      'An optional turn order tracking message will appear below for 30 minutes if players want to contribute turn order data.'
+    )
+    .addFields(
+      players.map(p => {
+        const r = preRatings[p.userId];
+        const rec = records[p.userId];
+        const turnOrderDisplay = p.turnOrder ? ` [Turn ${p.turnOrder}]` : '';
+        const commanderDisplay = p.commander ? ` 🃃 ${p.commander}` : '';
+        return {
+          name: `${userNames[p.userId]}${commanderDisplay}${turnOrderDisplay}${p.team ? ` (${p.team})` : ''}`,
+          value:
+            `Result: ${p.status?.toUpperCase() ?? '❓'}\n` +
+            (p.commander ? `Deck/Team: ${p.commander}\n` : '') +
+            (p.turnOrder ? `Turn Order: ${p.turnOrder}\n` : '') +
+            `Elo: ${calculateElo(r.mu, r.sigma)}\n` +
+            `Mu: ${r.mu.toFixed(2)}\n` +
+            `Sigma: ${r.sigma.toFixed(2)}\n` +
+            `W/L/D: ${rec.wins}/${rec.losses}/${rec.draws}`,
+          inline: false
+        };
+      })
+    )
+    .setColor(0x00AE86);
+
+  const replyMsg = await interaction.editReply({
+    content: `📢 Game results submitted.`,
+    embeds: [adminEmbed]
+  });
+
+  const matchId = crypto.randomUUID();
+
+  // Process immediately
+  await processGameResults(players, preRatings, records, userNames, matchId, gameId, gameSequence, numPlayers, true, interaction.user.id, replyMsg, client, isCEDHMode, gameDate);
+
+  // Handle recalculation if needed
+  if (afterGameId) {
+    await recalculateAllPlayersFromScratch();
+    await recalculateAllDecksFromScratch(); // includes 0/0/0 cleanup
+
+    await showTop50PlayersAndDecks(interaction);
+  }
+
+  // Handle turn order collection
+  const providedTurnOrders = new Set(players.filter(p => p.turnOrder).map(p => p.turnOrder!));
+  const missingTurnOrders = [1, 2, 3, 4].filter(t => !providedTurnOrders.has(t));
+  const turnOrderEmojis = ['1️⃣', '2️⃣'];
+  
+  if (missingTurnOrders.length > 0) {
+    try {
+      for (const turnOrder of missingTurnOrders) {
+        try {
+          await replyMsg.react(turnOrderEmojis[turnOrder - 1]);
+        } catch (error) {
+          logger.error(`Failed to add admin reaction for turn order ${turnOrder}:`, error);
+        }
+      }
+    } catch (error) {
+      logger.error('Failed to add admin turn order reactions:', error);
+    }
+
+    const turnOrderSelections = new Map<string, number>();
+
+const turnOrderCollector = replyMsg.createReactionCollector({
+  filter: (reaction, user) => !user.bot,
+  time: 30 * 60 * 1000
+});
+
+// Maintain clean state for admin collector too
+const adminCleanTurnOrderState = new Map<string, number>();
+
+// Add auto-assignment logic for admin games
+const checkAndApplyAdminAutoAssignment = () => {
+  const playersWithTurnOrder = players.filter(p => p.turnOrder !== undefined || adminCleanTurnOrderState.has(p.userId));
+  const playersWithoutTurnOrder = players.filter(p => p.turnOrder === undefined && !adminCleanTurnOrderState.has(p.userId));
+  
+  // If exactly 3 players have turn orders and 1 doesn't, auto-assign
+  if (playersWithTurnOrder.length === 3 && playersWithoutTurnOrder.length === 1) {
+    const providedTurnOrders = new Set([
+      ...players.filter(p => p.turnOrder !== undefined).map(p => p.turnOrder!),
+      ...Array.from(adminCleanTurnOrderState.values())
+    ]);
+    
+    const allTurnOrders = [1, 2, 3, 4];
+    const missingTurnOrder = allTurnOrders.find(t => !providedTurnOrders.has(t));
+    
+    if (missingTurnOrder) {
+      const playerWithoutTurnOrder = playersWithoutTurnOrder[0];
+      adminCleanTurnOrderState.set(playerWithoutTurnOrder.userId, missingTurnOrder);
+      
+      return {
+        autoAssigned: true,
+        player: playerWithoutTurnOrder,
+        turnOrder: missingTurnOrder
+      };
+    }
+  }
+  
+  return { autoAssigned: false };
+};
+
+// Updated admin embed update function
+const updateAdminEmbedWithTurnOrders = async () => {
+  const validUsers = new Set(players.map(p => p.userId));
+  
+  // Check for auto-assignment
+  const autoAssignResult = checkAndApplyAdminAutoAssignment();
+  
+  const currentTurnOrders = Array.from(adminCleanTurnOrderState.entries())
+    .filter(([userId, order]: [string, number]) => validUsers.has(userId) && order > 0)
+    .map(([userId, order]: [string, number]) => {
+      const isAutoAssigned = autoAssignResult.autoAssigned && 
+                            autoAssignResult.player?.userId === userId;
+      return `<@${userId}>: Turn ${order}${isAutoAssigned ? ' (auto-assigned)' : ''}`;
+    })
+    .join(', ');
+  
+  try {
+    const updatedEmbed = EmbedBuilder.from(adminEmbed);
+    
+    if (currentTurnOrders) {
+      let footerText = `Turn orders recorded: ${currentTurnOrders}`;
+      
+      if (autoAssignResult.autoAssigned) {
+        footerText += ` | ✨ Auto-assigned Turn ${autoAssignResult.turnOrder} to <@${autoAssignResult.player!.userId}>`;
+      }
+      
+      updatedEmbed.setFooter({ text: footerText });
+    } else {
+      updatedEmbed.setFooter({ text: 'Turn order collection period (30 minutes)' });
+    }
+    
+    await replyMsg.edit({ embeds: [updatedEmbed] });
+  } catch (error) {
+    logger.error('Failed to update admin embed with turn order progress:', error);
+  }
+};
+
+turnOrderCollector.on('collect', async (reaction, user) => {
+  // Always remove unauthorized reactions immediately
+  const validUsers = new Set(players.map(p => p.userId));
+  const turnOrderEmojis = ['1️⃣', '2️⃣'];
+  
+  if (!validUsers.has(user.id) || !turnOrderEmojis.includes(reaction.emoji.name!)) {
+    try {
+      await reaction.users.remove(user.id);
+    } catch (error) {
+      logger.error('Failed to remove unauthorized admin reaction:', error);
+    }
+    return; // Exit immediately
+  }
+
+  const playerHasTurnOrder = players.find(p => p.userId === user.id)?.turnOrder !== undefined;
+  if (playerHasTurnOrder) {
+    try {
+      await reaction.users.remove(user.id);
+    } catch (error) {
+      logger.error('Failed to remove reaction from player with existing turn order:', error);
+    }
+    return;
+  }
+
+  const turnOrder = turnOrderEmojis.indexOf(reaction.emoji.name!) + 1;
+
+  // Check if this turn order was provided inline (from command input)
+  if (!missingTurnOrders.includes(turnOrder)) {
+    try {
+      await reaction.users.remove(user.id);
+    } catch (error) {
+      logger.error('Failed to remove unavailable admin turn order reaction:', error);
+    }
+    return;
+  }
+
+  // Check if this turn order is already claimed by ANOTHER user via reactions
+  const currentHolder = Array.from(adminCleanTurnOrderState.entries()).find(
+    ([otherId, otherOrder]) => otherId !== user.id && otherOrder === turnOrder
+  );
+  if (currentHolder) {
+    // Turn already taken by someone else - reject (first come, first served)
+    try {
+      await reaction.users.remove(user.id);
+    } catch (error) {
+      logger.error('Failed to remove contested admin turn order reaction:', error);
+    }
+    return;
+  }
+
+  // If this user already had a different turn order, free it and remove old reaction
+  if (adminCleanTurnOrderState.has(user.id)) {
+    const oldTurnOrder = adminCleanTurnOrderState.get(user.id)!;
+    adminCleanTurnOrderState.delete(user.id);
+    // Remove their old turn order reaction so the spot visually opens up
+    try {
+      const oldEmoji = turnOrderEmojis[oldTurnOrder - 1];
+      const oldReaction = replyMsg.reactions.cache.find(r => r.emoji.name === oldEmoji);
+      if (oldReaction) await oldReaction.users.remove(user.id);
+    } catch (error) {
+      logger.error('Failed to remove old admin turn order reaction:', error);
+    }
+  }
+
+  // Claim this turn order
+  adminCleanTurnOrderState.set(user.id, turnOrder);
+
+  // Update embed using our clean state only
+  await updateAdminEmbedWithTurnOrders();
+});
+
+turnOrderCollector.on('end', async (collected, reason) => {
+  try {
+    if (reason === 'time') {
+      // Use our clean state instead of Discord reactions
+      const finalTurnOrders: [string, number][] = Array.from(adminCleanTurnOrderState.entries())
+        .filter(([userId, order]) => players.some(p => p.userId === userId) && order > 0);
+
+        // Apply any auto-assignments from the collection period
+for (const [userId, turnOrder] of adminCleanTurnOrderState.entries()) {
+  // Only add if this player didn't already have a turn order from the original command
+  const playerHadOriginalTurnOrder = players.find(p => p.userId === userId)?.turnOrder !== undefined;
+  if (!playerHadOriginalTurnOrder && !finalTurnOrders.some(([id]) => id === userId)) {
+    finalTurnOrders.push([userId, turnOrder]);
+  }
+}
+      
+      if (finalTurnOrders.length > 0) {
+        logger.info(`Updating ${finalTurnOrders.length} turn orders for admin game ${gameId}`);
+        for (const [userId, turnOrder] of finalTurnOrders) {
+          try {
+            await updateMatchTurnOrder(matchId, userId, turnOrder);
+          } catch (error) {
+            logger.error(`Failed to update turn order for user ${userId}:`, error);
+          }
+        }
+      }
+
+      const finalTurnOrderDisplay = finalTurnOrders
+        .map(([userId, order]) => `<@${userId}>: Turn ${order}`)
+        .join(', ');
+      
+      const finalEmbed = EmbedBuilder.from(adminEmbed);
+      if (finalTurnOrderDisplay) {
+        finalEmbed.setFooter({ text: `Final turn orders: ${finalTurnOrderDisplay} (Collection period ended)` });
+      } else {
+        finalEmbed.setFooter({ text: 'Turn order collection period ended (30 minutes)' });
+      }
+      
+      await replyMsg.edit({ embeds: [finalEmbed] });
+    }
+  } catch (error) {
+    logger.error('Error in admin turn order end handler:', error);
+  }
+});
+  }
+} else {
+  // Non-admin block - properly structured
+  const nonAdminEmbed = new EmbedBuilder()
+    .setTitle(`⚔️ Game Results Pending Confirmation`)
+    .setDescription(
+      `**Both players must confirm their participation:**\n` +
+      '• **FIRST**: Click 1️⃣ (went first) or 2️⃣ (went second) if you want to track turn order (optional)\n' +
+      '• **THEN**: React with 👍 to **confirm** your result\n' +
+      '• React with ❌ to **cancel** this game (creator only)\n\n' +
+      '**Turn order tracking is optional** - you can use `/setturnorder` later if you forget.\n\n' +
+      '💡 **Tip**: You can assign turn order when submitting by adding `1` or `2` before or after w/l/d.\n' +
+      'Example: `/rank @player1 1 w @player2 2 l`\n\n' +
+      `🎯 **Game ID: ${gameId}**${injectionNote}${additionalInfo}\n\n` +
+      '⏰ Game expires in 1 hour if both players don\'t confirm.'
+    )
+    .addFields(
+      players.map(p => {
+        const r = preRatings[p.userId];
+        const rec = records[p.userId];
+        const turnOrderDisplay = p.turnOrder ? ` [Turn ${p.turnOrder}]` : '';
+        const commanderDisplay = p.commander ? ` 🃃 ${p.commander}` : '';
+        return {
+          name: `${userNames[p.userId]}${commanderDisplay}${turnOrderDisplay}${p.team ? ` (${p.team})` : ''}`,
+          value:
+            `Result: ${p.status?.toUpperCase() ?? '❓'}\n` +
+            (p.commander ? `Deck/Team: ${p.commander}\n` : '') +
+            (p.turnOrder ? `Turn Order: ${p.turnOrder}\n` : '') +
+            `Elo: ${calculateElo(r.mu, r.sigma)}\n` +
+            `Mu: ${r.mu.toFixed(2)}\n` +
+            `Sigma: ${r.sigma.toFixed(2)}\n` +
+            `W/L/D: ${rec.wins}/${rec.losses}/${rec.draws}`,
+          inline: false
+        };
+      })
+    )
+    .setColor(0x00AE86);
+
+  const pinged = players.map(p => `<@${p.userId}>`).join(' ');
+  const replyMsg = await interaction.editReply({
+    content: `📢 Game results submitted. Waiting for confirmations from: ${pinged}`,
+    embeds: [nonAdminEmbed]
+  });
+
+  const matchId = crypto.randomUUID();
+    // Non-admin: wait for confirmations with enhanced reaction system
+    const pending = new Set(players.map(p => p.userId));
+    // Remove the bot from pending confirmations - it can't confirm itself
+    if (client.user?.id) {
+      pending.delete(client.user.id);
+    }
+    
+    try {
+  // Add all reaction options
+  await replyMsg.react('👍');
+  await replyMsg.react('❌'); // Cancel option
+  
+  // Add turn order reactions only for positions not already specified
+  const providedTurnOrders = new Set(players.filter(p => p.turnOrder).map(p => p.turnOrder!));
+  const missingTurnOrders = [1, 2, 3, 4].filter(t => !providedTurnOrders.has(t));
+  const turnOrderEmojis = ['1️⃣', '2️⃣'];
+  
+  // Only add turn order reactions if there are missing turn orders
+  if (missingTurnOrders.length > 0) {
+    for (const turnOrder of missingTurnOrders) {
+      try {
+        await replyMsg.react(turnOrderEmojis[turnOrder - 1]);
+      } catch (error) {
+        logger.error(`Failed to add reaction for turn order ${turnOrder}:`, error);
+      }
+    }
+  }
+} catch (error) {
+  logger.error('Failed to add basic reactions:', error);
+  // Continue execution even if reactions fail
+}
+
+
+    // Track players in limbo (exclude the bot)
+    const limboUsers = new Set(players.map(p => p.userId).filter(id => id !== client.user?.id));
+    if (players.map(p => p.userId).includes(interaction.user.id)) {
+      limboUsers.add(interaction.user.id);
+    }
+    client.limboGames.set(replyMsg.id, { gameId, gameType: 'player', players: limboUsers });
+
+    // Track turn order selections
+    const turnOrderSelections = new Map<string, number>();
+
+ const providedTurnOrders = new Set(players.filter(p => p.turnOrder).map(p => p.turnOrder!));
+const missingTurnOrders = [1, 2, 3, 4].filter(t => !providedTurnOrders.has(t));
+
+// Replace the non-admin collector with this approach that maintains its own state
+const collector = replyMsg.createReactionCollector({
+  filter: (reaction, user) => !user.bot,
+  time: 60 * 60 * 1000
+});
+
+// Add processing flag to prevent double processing
+let isProcessing = false;
+
+// Maintain our own clean state - ignore Discord reactions for display
+const cleanTurnOrderState = new Map<string, number>();
+
+// Add this function for auto-assignment logic
+const checkAndApplyAutoAssignment = () => {
+  const playersWithTurnOrder = players.filter(p => p.turnOrder !== undefined || cleanTurnOrderState.has(p.userId));
+  const playersWithoutTurnOrder = players.filter(p => p.turnOrder === undefined && !cleanTurnOrderState.has(p.userId));
+  
+  // If exactly 3 players have turn orders and 1 doesn't, auto-assign
+  if (playersWithTurnOrder.length === 3 && playersWithoutTurnOrder.length === 1) {
+    const providedTurnOrders = new Set([
+      ...players.filter(p => p.turnOrder !== undefined).map(p => p.turnOrder!),
+      ...Array.from(cleanTurnOrderState.values())
+    ]);
+    
+    const allTurnOrders = [1, 2, 3, 4];
+    const missingTurnOrder = allTurnOrders.find(t => !providedTurnOrders.has(t));
+    
+    if (missingTurnOrder) {
+      const playerWithoutTurnOrder = playersWithoutTurnOrder[0];
+      cleanTurnOrderState.set(playerWithoutTurnOrder.userId, missingTurnOrder);
+      
+      return {
+        autoAssigned: true,
+        player: playerWithoutTurnOrder,
+        turnOrder: missingTurnOrder
+      };
+    }
+  }
+  
+  return { autoAssigned: false };
+};
+
+// Updated embed update function that shows auto-assignments
+const updateEmbedWithTurnOrders = async () => {
+  const validUsers = new Set(players.map(p => p.userId));
+  
+  // Check for auto-assignment
+  const autoAssignResult = checkAndApplyAutoAssignment();
+  
+  const currentTurnOrders = Array.from(cleanTurnOrderState.entries())
+    .filter(([userId, order]: [string, number]) => validUsers.has(userId) && order > 0)
+    .map(([userId, order]: [string, number]) => {
+      const isAutoAssigned = autoAssignResult.autoAssigned && 
+                            autoAssignResult.player?.userId === userId;
+      return `<@${userId}>: Turn ${order}${isAutoAssigned ? ' (auto-assigned)' : ''}`;
+    })
+    .join(', ');
+  
+  try {
+    const updatedEmbed = EmbedBuilder.from(nonAdminEmbed);
+    
+    if (currentTurnOrders) {
+      let footerText = `Turn orders recorded: ${currentTurnOrders}`;
+      
+      if (autoAssignResult.autoAssigned) {
+        footerText += `\n\n✨ Auto-assigned Turn ${autoAssignResult.turnOrder} to <@${autoAssignResult.player!.userId}> (3/4 orders provided)`;
+      }
+      
+      updatedEmbed.setFooter({ text: footerText });
+    } else {
+      updatedEmbed.setFooter(null);
+    }
+    
+    await replyMsg.edit({ embeds: [updatedEmbed] });
+  } catch (error) {
+    logger.error('Failed to update embed:', error);
+  }
+};
+
+collector.on('collect', async (reaction, user) => {
+  // Always remove unauthorized reactions immediately
+  const validUsers = new Set(players.map(p => p.userId));
+  validUsers.add(interaction.user.id);
+  const validEmojis = ['👍', '❌', '1️⃣', '2️⃣'];
+  
+  if (!validUsers.has(user.id) || !validEmojis.includes(reaction.emoji.name!)) {
+    try {
+      await reaction.users.remove(user.id);
+    } catch (error) {
+      logger.error('Failed to remove unauthorized reaction:', error);
+    }
+    return; // Exit immediately - don't process anything
+  }
+
+  // Handle cancellation
+  if (reaction.emoji.name === '❌' && user.id === interaction.user.id) {
+    try {
+      if (isProcessing) return; // Prevent cancellation during processing
+      collector.stop('cancelled');
+      client.limboGames.delete(replyMsg.id);
+      await cleanupUnconfirmedGame(gameId);
+
+      const cancelEmbed = new EmbedBuilder()
+        .setTitle('❌ Game Cancelled')
+        .setDescription('The game creator has cancelled this pending game.')
+        .setColor(0xFF0000);
+      
+      const chan = replyMsg.channel as TextChannel;
+      await chan.send({ 
+        content: `🚫 **Game Cancelled**: Game ID ${gameId} was cancelled by the submitter.`,
+        embeds: [cancelEmbed] 
+      });
+      return;
+    } catch (error) {
+      logger.error('Error in cancellation handler:', error);
+      return;
+    }
+  }
+
+  // Handle confirmation - ALLOW all game participants to confirm
+  if (reaction.emoji.name === '👍' && pending.has(user.id)) {
+    pending.delete(user.id);
+    
+    // Apply auto-assignment if applicable before checking completion
+    checkAndApplyAutoAssignment();
+    
+    // Update embed to show current confirmation status
+    try {
+      if (pending.size > 0) {
+        const remainingUsers = Array.from(pending).map(id => `<@${id}>`).join(', ');
+        const updatedContent = `📢 Game results submitted. Waiting for confirmations from: ${remainingUsers}`;
+        await interaction.editReply({ content: updatedContent });
+      }
+    } catch (error) {
+      logger.error('Failed to update confirmation status:', error);
+    }
+    
+    // CRITICAL FIX: Add processing guard
+    if (pending.size === 0 && !isProcessing) {
+      isProcessing = true; // Set flag immediately
+      
+      try {
+        collector.stop('confirmed');
+        client.limboGames.delete(replyMsg.id);
+
+        // Use our clean state instead of reading from Discord reactions
+        for (const player of players) {
+          if (!player.turnOrder && cleanTurnOrderState.has(player.userId)) {
+            player.turnOrder = cleanTurnOrderState.get(player.userId);
+          }
+        }
+
+        // Auto-assign logic
+        const playersWithTurnOrder = players.filter(p => p.turnOrder !== undefined);
+        const playersWithoutTurnOrder = players.filter(p => p.turnOrder === undefined);
+        
+        if (playersWithTurnOrder.length === 3 && playersWithoutTurnOrder.length === 1) {
+          const finalProvidedTurnOrders = new Set(playersWithTurnOrder.map(p => p.turnOrder!));
+          const allTurnOrders = [1, 2, 3, 4];
+          const finalMissingTurnOrder = allTurnOrders.find(t => !finalProvidedTurnOrders.has(t));
+          
+          if (finalMissingTurnOrder) {
+            playersWithoutTurnOrder[0].turnOrder = finalMissingTurnOrder;
+          }
+        }
+
+        await processGameResults(players, preRatings, records, userNames, matchId, gameId, gameSequence, numPlayers, false, interaction.user.id, replyMsg, client, isCEDHMode, gameDate);
+        
+        if (afterGameId) {
+          await recalculateAllPlayersFromScratch();
+          await recalculateAllDecksFromScratch(); // includes 0/0/0 cleanup
+
+          await showTop50PlayersAndDecks(interaction);
+        }
+      } catch (error) {
+        logger.error('Error processing game results:', error);
+        isProcessing = false; // Reset flag on error
+        try {
+          await interaction.followUp({ content: '❌ An error occurred while processing game results. Please check the logs.', ephemeral: true });
+        } catch {
+          // Interaction may have expired
+        }
+      }
+    }
+    return;
+  }
+
+  // Handle turn order reactions - first come first served, users can change their own
+  const turnOrderEmojis = ['1️⃣', '2️⃣'];
+  if (turnOrderEmojis.includes(reaction.emoji.name!)) {
+    const isParticipant = players.some(p => p.userId === user.id);
+    const playerHasTurnOrder = players.find(p => p.userId === user.id)?.turnOrder !== undefined;
+
+    if (!isParticipant || playerHasTurnOrder) {
+      try {
+        await reaction.users.remove(user.id);
+      } catch (error) {
+        logger.error('Failed to remove invalid turn order reaction:', error);
+      }
+      return;
+    }
+
+    const turnOrder = turnOrderEmojis.indexOf(reaction.emoji.name!) + 1;
+
+    // Check if this turn order is already provided inline (from command input)
+    const inlineTurnOrders = new Set(players.filter(p => p.turnOrder).map(p => p.turnOrder!));
+    if (inlineTurnOrders.has(turnOrder)) {
+      try {
+        await reaction.users.remove(user.id);
+      } catch (error) {
+        logger.error('Failed to remove unavailable turn order reaction:', error);
+      }
+      return;
+    }
+
+    // Check if this turn order is already claimed by ANOTHER user via reactions
+    const currentHolder = Array.from(cleanTurnOrderState.entries()).find(
+      ([otherId, otherOrder]) => otherId !== user.id && otherOrder === turnOrder
+    );
+    if (currentHolder) {
+      // Turn already taken by someone else - reject (first come, first served)
+      try {
+        await reaction.users.remove(user.id);
+      } catch (error) {
+        logger.error('Failed to remove contested turn order reaction:', error);
+      }
+      return;
+    }
+
+    // If this user already had a different turn order, free it and remove old reaction
+    if (cleanTurnOrderState.has(user.id)) {
+      const oldTurnOrder = cleanTurnOrderState.get(user.id)!;
+      cleanTurnOrderState.delete(user.id);
+      // Remove their old turn order reaction so the spot visually opens up
+      try {
+        const oldEmoji = turnOrderEmojis[oldTurnOrder - 1];
+        const oldReaction = replyMsg.reactions.cache.find(r => r.emoji.name === oldEmoji);
+        if (oldReaction) await oldReaction.users.remove(user.id);
+      } catch (error) {
+        logger.error('Failed to remove old turn order reaction:', error);
+      }
+    }
+
+    // Claim this turn order
+    cleanTurnOrderState.set(user.id, turnOrder);
+
+    // Update embed using our clean state only
+    await updateEmbedWithTurnOrders();
+  }
+});
+collector.on('end', async (collected, reason) => {
+  try {
+    if (reason === 'time') {
+      client.limboGames.delete(replyMsg.id);
+      await cleanupUnconfirmedGame(gameId);
+
+      const timeoutEmbed = new EmbedBuilder()
+        .setTitle('⏰ Game Expired')
+        .setDescription('This game timed out after 1 hour without all players confirming.')
+        .setColor(0xFF6B6B);
+      
+      const timeoutMsg = `⏰ **Game Expired**: ${pinged} - Your pending game timed out after 1 hour without full confirmation.`;
+      const chan = replyMsg.channel as TextChannel;
+      
+      try {
+        await chan.send({ content: timeoutMsg, embeds: [timeoutEmbed] });
+      } catch (error) {
+        logger.error('Failed to send timeout notification:', error);
+      }
+    } else if (reason === 'cancelled') {
+      return;
+    }
+  } catch (error) {
+    logger.error('Error in collector end handler:', error);
+  }
+});
+}}
+
+// Separate function for deck-only mode
+async function executeDeckOnlyMode(
+  interaction: ChatInputCommandInteraction,
+  client: ExtendedClient,
+  input: string,
+  afterGameId: string | null
+): Promise<void> {
+  // Parse input: deck/team name followed by w/l/d (deck-vs-deck mode is also 1v1).
+  const tokens = input.trim().split(/\s+/);
+  if (tokens.length !== 4) {
+    await interaction.editReply({
+      content: '⚠️ Invalid format for deck-only mode. Use: `deck-name w/l/d deck-name w/l/d`\n' +
+               'Example: `mewtwo-hyper-offense w all-psychic l`\n' +
+               'Note: deck-vs-deck mode is 1v1 (exactly two entries).'
+    });
+    return;
+  }
+
+  const decks: DeckEntry[] = [];
+  for (let i = 0; i < tokens.length; i += 2) {
+    const commanderName = tokens[i];
+    const result = tokens[i + 1]?.toLowerCase();
+
+    if (!['w', 'l', 'd'].includes(result)) {
+      await interaction.editReply({
+        content: `⚠️ Invalid result "${result}" for ${commanderName}. Use w (win), l (loss), or d (draw).`
+      });
+      return;
+    }
+
+    const normalizedName = normalizeCommanderName(commanderName);
+    decks.push({
+      commander: commanderName,
+      normalizedName,
+      status: result as 'w' | 'l' | 'd',
+      turnOrder: (i / 2) + 1 // Turn order based on position in input
+    });
+  }
+
+  // Deck-only 1v1 — exactly 2 decks.
+  if (decks.length !== 2) {
+    await interaction.editReply({
+      content: '⚠️ PokemonSkill only supports 1v1 (2-deck) games.'
+    });
+    return;
+  }
+
+  const winCount = decks.filter(d => d.status === 'w').length;
+  const drawCount = decks.filter(d => d.status === 'd').length;
+  const lossCount = decks.filter(d => d.status === 'l').length;
+
+  // Three legal outcomes: deck1 wins / deck2 wins / draw.
+  if (winCount === 1 && lossCount === 1 && drawCount === 0) {
+    // Valid: one winner, one loser
+  } else if (winCount === 0 && lossCount === 0 && drawCount === 2) {
+    // Valid: draw
+  } else {
+    await interaction.editReply({
+      content: '⚠️ Invalid result combination for 1v1 deck format. Must be either: 1 winner + 1 loser, or 2 draws.'
+    });
+    return;
+  }
+
+  // Generate unique game ID
+  const gameId = await generateUniqueGameId();
+  await recordGameId(gameId, 'deck');
+
+  // Get game sequence number (for injection or regular)
+  let gameSequence: number;
+  let deckInjectedTimestamp: Date | null = null;
+  try {
+    const seqResult = await getNextGameSequence(afterGameId || undefined);
+    gameSequence = seqResult.sequence;
+    deckInjectedTimestamp = seqResult.injectedTimestamp;
+  } catch (error) {
+    await interaction.editReply({
+      content: `⚠️ Error: ${(error as Error).message}`
+    });
+    return;
+  }
+
+  // Use the injected timestamp for backdated games, or current time for regular games
+  const deckGameDate = deckInjectedTimestamp || new Date();
+
+  // Admin check for deck-only mode
+  const isAdmin = hasModAccess(interaction.user.id);
+  const submittedByAdmin = isAdmin;
+
+  // Store game in master table (with backdated timestamp if injecting)
+  await storeGameInMaster(gameId, gameSequence, interaction.user.id, 'deck', submittedByAdmin, deckInjectedTimestamp || undefined);
+
+  // Free-form deck/team name validation (no external lookup).
+  const uniqueCommanders = [...new Set(decks.map(d => d.normalizedName))];
+
+  const validationResults = await Promise.all(
+    uniqueCommanders.map(async (normalizedName) => ({
+      normalizedName,
+      valid: (await CommanderValidator.validateCommander(normalizedName)).valid
+    }))
+  );
+
+  const invalidDecks = validationResults.filter(r => !r.valid);
+  if (invalidDecks.length > 0) {
+    const invalidNames = invalidDecks.map(r =>
+      decks.find(d => d.normalizedName === r.normalizedName)?.commander
+    ).filter(Boolean).join(', ');
+
+    await interaction.editReply({
+      content: `⚠️ Invalid deck/team name format: ${invalidNames}\n` +
+               'Names must be 2–100 characters using letters, digits, spaces, hyphens, apostrophes, commas, or periods.'
+    });
+    return;
+  }
+
+  // Pre-fetch deck ratings and records for unique decks only
+  const deckRatings: Record<string, Rating> = {};
+  const deckRecords: Record<string, { wins: number; losses: number; draws: number }> = {};
+  
+  for (const normalizedName of uniqueCommanders) {
+    const displayName = decks.find(d => d.normalizedName === normalizedName)?.commander || normalizedName;
+    const deckData = await getOrCreateDeck(normalizedName, displayName);
+    deckRatings[normalizedName] = rating({ mu: deckData.mu, sigma: deckData.sigma });
+    deckRecords[normalizedName] = {
+      wins: deckData.wins || 0,
+      losses: deckData.losses || 0,
+      draws: deckData.draws || 0
+    };
+  }
+
+  const injectionNote = afterGameId 
+  ? afterGameId === '0' 
+    ? `\n\n🔥 **Game Pre-Injection**: This game will be placed BEFORE all existing games and all ratings will be recalculated.`
+    : `\n\n🔥 **Game Injection**: This game will be inserted after game "${afterGameId}" and all ratings will be recalculated.`
+  : '';
+
+  // Count duplicates for display
+  const deckCounts = decks.reduce((acc, deck) => {
+    acc[deck.normalizedName] = (acc[deck.normalizedName] || 0) + 1;
+    return acc;
+  }, {} as Record<string, number>);
+
+  // Initial embed showing the decks
+  const embed = new EmbedBuilder()
+    .setTitle(`⚔️ Deck Battle Results - ${isAdmin ? 'Auto Confirmed' : 'Awaiting Confirmation'}`)
+    .setDescription(
+      isAdmin
+        ? `✅ **Results submitted by admin. Deck ratings have been updated immediately.**\n\n` +
+          `🎯 **Game ID: ${gameId}**${injectionNote}`
+        : 'Please react with 👍 to confirm these deck results. Any 2 people can confirm.\n\n' +
+          `🎯 **Game ID: ${gameId}**${injectionNote}`
+    )
+    .addFields(
+      decks.map((deck, index) => {
+        const r = deckRatings[deck.normalizedName];
+        const rec = deckRecords[deck.normalizedName];
+        const duplicateNote = deckCounts[deck.normalizedName] > 1 ? ` (${deckCounts[deck.normalizedName]} copies in this game)` : '';
+        
+        return {
+          name: `Turn ${deck.turnOrder}: ${deck.commander}${duplicateNote}`,
+          value:
+            `Result: ${deck.status.toUpperCase()}\n` +
+            `Current Elo: ${calculateElo(r.mu, r.sigma)}\n` +
+            `Current Mu: ${r.mu.toFixed(2)}\n` +
+            `Current Sigma: ${r.sigma.toFixed(2)}\n` +
+            `Current W/L/D: ${rec.wins}/${rec.losses}/${rec.draws}`,
+          inline: true
+        };
+      })
+    )
+    .setColor(0x9932CC);
+
+  const replyMsg = await interaction.editReply({
+    content: isAdmin
+      ? '🔥 Deck battle results confirmed by admin.'
+      : '📢 Deck battle results submitted. Waiting for confirmations from at least 2 people.',
+    embeds: [embed]
+  });
+
+  const matchId = crypto.randomUUID();
+
+  if (isAdmin) {
+    // Admin path - process immediately
+    await processDeckResults(decks, deckRatings, deckRecords, matchId, gameId, gameSequence, submittedByAdmin, interaction.user.id, replyMsg, deckGameDate);
+
+    // If this was a deck game injection, recalculate all ratings
+    if (afterGameId) {
+      await recalculateAllPlayersFromScratch();
+      await recalculateAllDecksFromScratch(); // includes 0/0/0 cleanup
+    }
+  } else {
+    // Add reactions for confirmation and cancellation
+    await replyMsg.react('👍');
+    await replyMsg.react('❌'); // Add cancel option
+
+    // Add processing flag to prevent double processing for deck battles
+    let isProcessingDeck = false;
+
+    // Track confirmations (any 2 people can confirm)
+    const confirmations = new Set<string>();
+    const requiredConfirmations = 2;
+
+    // Track this game in limbo
+    client.limboGames.set(replyMsg.id, { gameId, gameType: 'deck', players: new Set([interaction.user.id]) });
+
+    const collector = replyMsg.createReactionCollector({
+      filter: (reaction, user) =>
+        (reaction.emoji.name === '👍' || reaction.emoji.name === '❌') && !user.bot,
+      time: 60 * 60 * 1000 // 1 hour timeout
+    });
+
+    collector.on('collect', async (reaction, user) => {
+      // Handle cancellation (only submitter can cancel)
+      if (reaction.emoji.name === '❌' && user.id === interaction.user.id) {
+        try {
+          collector.stop('cancelled');
+          client.limboGames.delete(replyMsg.id);
+          await cleanupUnconfirmedGame(gameId);
+
+          // Notify that deck battle was cancelled
+          const cancelEmbed = new EmbedBuilder()
+            .setTitle('❌ Deck Battle Cancelled')
+            .setDescription('The deck battle submitter has cancelled this pending game.')
+            .setColor(0xFF0000);
+          
+          const cancelMsg = `🚫 **Deck Battle Cancelled**: Game ID ${gameId} - Your pending deck battle was cancelled by the submitter.`;
+          const chan = replyMsg.channel as TextChannel;
+          
+          try {
+            await chan.send({ content: cancelMsg, embeds: [cancelEmbed] });
+          } catch (error) {
+            logger.error('Failed to send deck battle cancellation notification:', error);
+          }
+          return;
+        } catch (error) {
+          logger.error('Error handling deck battle cancellation:', error);
+          return;
+        }
+      }
+
+      // Handle confirmation
+      if (reaction.emoji.name === '👍') {
+        confirmations.add(user.id);
+        
+        // Update the embed to show progress
+        const updatedEmbed = EmbedBuilder.from(embed)
+          .setTitle('⚔️ Deck Battle Results - Awaiting Confirmation')
+          .setDescription(
+            `Please react with 👍 to confirm these deck results. Any 2 people can confirm.\n` +
+            `React with ❌ to cancel this deck battle (submitter only).\n\n` +
+            `🎯 **Game ID: ${gameId}**${injectionNote}\n\n` +
+            `✅ **Confirmations: ${confirmations.size}/${requiredConfirmations}**`
+          );
+        
+        await replyMsg.edit({ embeds: [updatedEmbed] });
+        
+        // CRITICAL FIX: Add processing guard for deck battles too
+        if (confirmations.size >= requiredConfirmations && !isProcessingDeck) {
+          isProcessingDeck = true; // Set flag immediately
+          
+          try {
+            collector.stop('confirmed');
+            client.limboGames.delete(replyMsg.id);
+
+            // Process deck results (submittedByAdmin is false for non-admin path)
+            await processDeckResults(decks, deckRatings, deckRecords, matchId, gameId, gameSequence, false, interaction.user.id, replyMsg, deckGameDate);
+            
+            // If this was a deck game injection, recalculate all ratings
+            if (afterGameId) {
+              await recalculateAllPlayersFromScratch();
+              await recalculateAllDecksFromScratch(); // includes 0/0/0 cleanup
+            }
+          } catch (error) {
+            logger.error('Error processing deck results:', error);
+            isProcessingDeck = false; // Reset flag on error
+            try {
+              await interaction.followUp({ content: '❌ An error occurred while processing deck results. Please check the logs.', ephemeral: true });
+            } catch {
+              // Interaction may have expired
+            }
+          }
+        }
+      }
+    });
+
+    collector.on('end', async (collected, reason) => {
+      if (reason === 'time') {
+        client.limboGames.delete(replyMsg.id);
+        await cleanupUnconfirmedGame(gameId);
+
+        const timeoutEmbed = new EmbedBuilder()
+          .setTitle('⏰ Deck Battle Expired')
+          .setDescription('This deck battle timed out after 1 hour without sufficient confirmations.')
+          .setColor(0xFF6B6B);
+        
+        const timeoutMsg = `⏰ **Deck Battle Expired**: Game ID ${gameId} - Your pending deck battle timed out after 1 hour without sufficient confirmations.`;
+        
+        try {
+          const chan = replyMsg.channel as TextChannel;
+          await chan.send({ content: timeoutMsg, embeds: [timeoutEmbed] });
+        } catch (error) {
+          logger.error('Failed to send deck battle timeout notification:', error);
+        }
+      } else if (reason === 'cancelled') {
+        // Already handled in the collect event
+        return;
+      }
+    });
+  }
+}
+
+async function processGameResults(
+  players: PlayerEntry[],
+  preRatings: Record<string, Rating>,
+  records: Record<string, any>,
+  userNames: Record<string, string>,
+  matchId: string,
+  gameId: string,
+  gameSequence: number,
+  numPlayers: number,
+  submittedByAdmin: boolean,
+  submitterId: string,
+  replyMsg: any,
+  client: any,
+  isCEDHMode: boolean,
+  gameDate: Date
+): Promise<string[]> {
+  // Note: We don't reset timewalk here - the per-player check handles this
+  // Players who just played won't have cumulative timewalk days applied to them
+
+  const statusRank: Record<string, number> = { w: 1, d: 2, l: 3 };
+  const prs = players.map(p => ({
+    ...p,
+    key: typeof p.score === 'number' ? `score:${p.score}` : `status:${p.status}`
+  }));
+  
+  const sortCopy = [...prs].sort((a, b) => {
+    if (typeof a.score === 'number' && typeof b.score === 'number') {
+      return b.score - a.score;
+    }
+    if (a.status && b.status) {
+      return (statusRank[a.status] ?? 99) - (statusRank[b.status] ?? 99);
+    }
+    return 0;
+  });
+  
+  const ranks: number[] = [];
+  let cr = 1;
+  for (let i = 0; i < sortCopy.length; i++) {
+    if (i > 0 && sortCopy[i].key !== sortCopy[i - 1].key) cr = i + 1;
+    ranks[players.findIndex(p => p.userId === sortCopy[i].userId)] = cr;
+  }
+
+  const ordered = players.map(p => [preRatings[p.userId]]);
+  let newMatrix = rate(ordered, { rank: ranks });
+  
+  // Apply 3-player penalty if in cEDH mode
+  if (isCEDHMode && numPlayers === 3) {
+    newMatrix = newMatrix.map(rating => {
+      const newRating = rating[0];
+      const adjustedMu = 25 + (newRating.mu - 25) * 0.9;
+      return [{ mu: adjustedMu, sigma: newRating.sigma }];
+    });
+  }
+  
+  const results: string[] = [];
+
+// FIXED: Auto-apply default decks ONLY for players without commanders AND only for FUTURE games
+for (const player of players) {
+  if (!player.commander) {
+    // Query default deck directly from database
+    const { getDatabase } = await import('../db/init.js');
+    const db = getDatabase();
+    
+    // Check if this is a NEW game (being submitted now) or an OLD game (already exists)
+    const existingMatch = await db.get(
+      'SELECT assignedDeck FROM matches WHERE userId = ? AND gameId = ?',
+      player.userId,
+      gameId
+    );
+    
+    // CRITICAL: Only auto-apply default deck if this is a NEW game submission
+    // Do NOT auto-apply for existing games (replays, recalculations, etc.)
+    if (!existingMatch) {
+      const playerData = await db.get('SELECT defaultDeck FROM players WHERE userId = ?', player.userId);
+
+      if (playerData?.defaultDeck) {
+        const deckData = await getOrCreateDeck(playerData.defaultDeck, playerData.defaultDeck);
+        player.commander = deckData.displayName;
+        player.normalizedCommanderName = playerData.defaultDeck;
+
+        logger.info(`[AUTO-ASSIGN] Applied default deck ${player.commander} to ${player.userId} for new game ${gameId}`);
+      } else {
+        logger.info(`[AUTO-ASSIGN] No default deck found for ${player.userId} (playerData: ${JSON.stringify(playerData)})`);
+      }
+    } else if (existingMatch.assignedDeck) {
+      // This is an existing game - use whatever deck was ALREADY assigned
+      const deckData = await db.get('SELECT displayName FROM decks WHERE normalizedName = ?', existingMatch.assignedDeck);
+      player.commander = deckData?.displayName || existingMatch.assignedDeck;
+      player.normalizedCommanderName = existingMatch.assignedDeck;
+      
+      logger.info(`[EXISTING] Preserved existing deck ${player.commander} for ${player.userId} in game ${gameId}`);
+    }
+  }
+}
+
+
+  // ENHANCED: Process commanders if any are assigned
+  const playersWithCommanders = players.filter(p => p.commander);
+  if (playersWithCommanders.length > 0) {
+    await processCommanderRatingsEnhanced(playersWithCommanders, players, gameId, matchId, gameDate);
+  }
+
+  // Track final ratings (including participation bonus) for snapshot
+  const finalRatings: Record<string, Rating> = {};
+
+  // Process player ratings (existing logic)
+  for (let i = 0; i < players.length; i++) {
+    const p = players[i];
+    const oldR = preRatings[p.userId];
+    let newR = newMatrix[i][0];
+
+    // Declare variables for display outside try block
+    const oldElo = calculateElo(oldR.mu, oldR.sigma);
+    let preBonusElo = oldElo;
+    let finalElo = oldElo;
+    let ratingChange = 0;
+    let changeSign = '+';
+
+    try {
+      // Step 1: Apply minimum rating change guarantee
+      newR = ensureMinimumRatingChange(oldR, newR, p.status!);
+
+      // Capture pre-bonus Elo for display
+      preBonusElo = calculateElo(newR.mu, newR.sigma);
+      ratingChange = preBonusElo - oldElo;
+      changeSign = ratingChange >= 0 ? '+' : '';
+
+      // Step 2: Apply participation bonus (+1 Elo for playing ranked, max 5/day)
+      const gamesAlreadyToday = await getPlayerGamesOnDateBefore(p.userId, gameDate, gameId);
+      newR = applyParticipationBonus(newR, gamesAlreadyToday);
+
+      // Track final rating for snapshot
+      finalRatings[p.userId] = newR;
+
+      // Calculate final Elo for display
+      finalElo = calculateElo(newR.mu, newR.sigma);
+
+      const rec = records[p.userId];
+      if (p.status === 'w') rec.wins++;
+      else if (p.status === 'l') rec.losses++;
+      else if (p.status === 'd') rec.draws++;
+
+      await updatePlayerRating(p.userId, newR.mu, newR.sigma, rec.wins, rec.losses, rec.draws);
+
+      // Record player activity for virtual clock (timewalk) tracking
+      recordPlayerActivity(p.userId);
+
+      await recordMatch(
+        matchId,
+        gameId,
+        p.userId,
+        p.status ?? 'd',
+        gameDate,
+        newR.mu,
+        newR.sigma,
+        [],
+        [],
+        p.score,
+        submittedByAdmin,
+        p.turnOrder,
+        p.normalizedCommanderName || null  // CRITICAL: Pass the normalized commander name
+      );
+    } catch (error) {
+      logger.error(`Failed to update player ${p.userId} rating/match:`, error);
+    }
+
+    // Log the rating change for audit trail
+    try {
+      await logRatingChange({
+        targetType: 'player',
+        targetId: p.userId,
+        targetDisplayName: userNames[p.userId],
+        changeType: 'game',
+        oldMu: oldR.mu,
+        oldSigma: oldR.sigma,
+        oldElo: calculateElo(oldR.mu, oldR.sigma),
+        newMu: newR.mu,
+        newSigma: newR.sigma,
+        newElo: calculateElo(newR.mu, newR.sigma),
+        parameters: JSON.stringify({
+          gameId: gameId,
+          result: p.status,
+          turnOrder: p.turnOrder,
+          opponents: players.length - 1,
+          submittedByAdmin: submittedByAdmin,
+          commander: p.commander || null
+        })
+      });
+    } catch (auditError) {
+      logger.error('Error logging player rating change to audit trail:', auditError);
+    }
+
+    const commanderInfo = p.commander ? ` [${p.commander}]` : '';
+    const bonusApplied = finalElo !== preBonusElo;
+    const bonusText = bonusApplied ? ` + 1 (participation)` : ` + 0 (daily bonus limit reached)`;
+    results.push(
+      `${userNames[p.userId]}${p.team ? ` (${p.team})` : ''}${p.turnOrder ? ` [Turn ${p.turnOrder}]` : ''}${commanderInfo}\n` +
+        `Elo: ${oldElo} → ${preBonusElo} (${changeSign}${ratingChange})${bonusText} = **${finalElo}**\n` +
+        `Mu: ${oldR.mu.toFixed(2)} → ${newR.mu.toFixed(2)} | Sigma: ${oldR.sigma.toFixed(2)} → ${newR.sigma.toFixed(2)}\n` +
+        `W/L/D: ${records[p.userId].wins}/${records[p.userId].losses}/${records[p.userId].draws}`
+    );
+  }
+
+  // Update matches with sequence number
+  await updateMatchesWithSequence(gameId, gameSequence, 'player');
+
+  // Build complete match data for snapshot (needed for proper undo/redo)
+  const matchDataForSnapshot = players.map(p => ({
+    id: matchId,
+    gameId: gameId,
+    userId: p.userId,
+    status: p.status ?? 'd',
+    matchDate: gameDate.toISOString(),
+    mu: finalRatings[p.userId].mu,
+    sigma: finalRatings[p.userId].sigma,
+    teams: JSON.stringify([]),
+    scores: JSON.stringify([]),
+    score: p.score ?? 0,
+    submittedByAdmin: submittedByAdmin,
+    turnOrder: p.turnOrder ?? null,
+    assignedDeck: p.normalizedCommanderName || null,
+    submittedBy: submitterId
+  }));
+
+  const gameTimestamp = gameDate.toISOString();
+  await saveMatchSnapshot({
+    matchId,
+    gameId,
+    gameSequence,
+    gameType: 'player',
+    matchData: matchDataForSnapshot,
+    before: players.map(p => ({
+      userId: p.userId,
+      mu: preRatings[p.userId].mu,
+      sigma: preRatings[p.userId].sigma,
+      wins: records[p.userId].wins - (players.find(x => x.userId === p.userId)?.status === 'w' ? 1 : 0),
+      losses: records[p.userId].losses - (players.find(x => x.userId === p.userId)?.status === 'l' ? 1 : 0),
+      draws: records[p.userId].draws - (players.find(x => x.userId === p.userId)?.status === 'd' ? 1 : 0),
+      tag: userNames[p.userId],
+      turnOrder: p.turnOrder,
+      commander: p.commander || undefined,
+      lastPlayed: records[p.userId].lastPlayed // Pre-game lastPlayed
+    })),
+    after: players.map((p) => ({
+      userId: p.userId,
+      mu: finalRatings[p.userId].mu,
+      sigma: finalRatings[p.userId].sigma,
+      wins: records[p.userId].wins,
+      losses: records[p.userId].losses,
+      draws: records[p.userId].draws,
+      tag: userNames[p.userId],
+      turnOrder: p.turnOrder,
+      commander: p.commander || undefined,
+      lastPlayed: gameTimestamp // Post-game lastPlayed (game happened now)
+    }))
+  });
+
+  const resultEmbed = new EmbedBuilder()
+    .setTitle('✅ All players have confirmed. Results are now final!')
+    .setDescription(`🎯 **Game ID: ${gameId}**\n\n` + results.join('\n\n'))
+    .setColor(0x4BB543);
+
+  const chan = replyMsg.channel as TextChannel;
+  await chan.send({ embeds: [resultEmbed] });
+
+  // Check for suspicious activity (but skip the bot)
+  for (const p of players.filter(p => p.status === 'w' && p.userId !== client.user?.id)) {
+    const alert = await checkForSuspiciousPatterns(p.userId, submittedByAdmin);
+    if (!alert) continue;
+
+    const alertRecipients = [...config.admins, ...config.moderators];
+for (const recipientId of alertRecipients) {
+  if (!(await getAlertOptIn(recipientId))) continue;
+  try {
+    const user = await client.users.fetch(recipientId);
+    await user.send(alert);
+  } catch {}
+}
+  }
+  
+  return results;
+}
+
+// Process commander ratings with phantom opponents
+// ENHANCED: New function that processes commander ratings with phantoms, allowing unassigned turn orders
+// Handles duplicate commanders properly and maps phantom status from unassigned players
+export async function processCommanderRatingsEnhanced(
+  playersWithCommanders: PlayerEntry[],
+  allPlayers: PlayerEntry[],
+  gameId: string,
+  matchId: string,
+  matchDate?: Date
+): Promise<void> {
+  // Create commander entries with flexible turn order assignment
+  const commanderEntries: any[] = [];
+
+  // Track which players have commanders assigned
+  const assignedPlayerIds = new Set(playersWithCommanders.map(p => p.userId));
+
+  // Add real commanders - use their assigned turn order OR fallback to position
+  for (const player of playersWithCommanders) {
+    const playerIndex = allPlayers.findIndex(p => p.userId === player.userId);
+
+    commanderEntries.push({
+      commander: player.commander!,
+      normalizedName: player.normalizedCommanderName!,
+      status: player.status!,
+      turnOrder: player.turnOrder !== undefined ? player.turnOrder : (playerIndex + 1),
+      isPhantom: false,
+      originalPlayer: player.userId
+    });
+  }
+
+  // Find unassigned players (those without commanders) to map phantom statuses
+  const unassignedPlayers = allPlayers.filter(p => !assignedPlayerIds.has(p.userId));
+
+  // Add phantom commanders to fill to 4, inheriting status from unassigned players
+  const phantomCount = 4 - commanderEntries.length;
+  const phantomMu = 25.0;
+  const phantomSigma = 8.333;
+
+  for (let i = 0; i < phantomCount; i++) {
+    const phantomTurnOrder = findAvailableTurnOrderForPhantoms(commanderEntries);
+
+    // Inherit status from unassigned player if available, otherwise default to 'l'
+    const phantomStatus = i < unassignedPlayers.length
+      ? (unassignedPlayers[i].status || 'l')
+      : 'l';
+
+    commanderEntries.push({
+      commander: `phantom-${i + 1}`,
+      normalizedName: `phantom-${i + 1}`,
+      status: phantomStatus,
+      turnOrder: phantomTurnOrder,
+      isPhantom: true,
+      mu: phantomMu,
+      sigma: phantomSigma,
+      originalPlayer: i < unassignedPlayers.length ? unassignedPlayers[i].userId : null
+    });
+  }
+
+  // Sort by turn order for proper rating calculation
+  commanderEntries.sort((a, b) => a.turnOrder - b.turnOrder);
+
+  // Get ratings for real commanders using per-instance approach (handles duplicates)
+  // Each entry gets its OWN rating object copy to avoid shared references
+  const entryRatings: Rating[] = [];
+
+  // We still need deck records keyed by normalizedName for DB updates
+  const commanderRecords: Record<string, any> = {};
+
+  for (const entry of commanderEntries) {
+    if (entry.isPhantom) {
+      entryRatings.push(rating({ mu: entry.mu, sigma: entry.sigma }));
+    } else {
+      const deckData = await getOrCreateDeck(entry.normalizedName, entry.commander);
+      // Each instance gets its own rating object (avoids shared references for duplicates)
+      entryRatings.push(rating({ mu: deckData.mu, sigma: deckData.sigma }));
+
+      // Only set the record once per unique commander
+      if (!commanderRecords[entry.normalizedName]) {
+        commanderRecords[entry.normalizedName] = {
+          wins: deckData.wins || 0,
+          losses: deckData.losses || 0,
+          draws: deckData.draws || 0,
+          displayName: deckData.displayName
+        };
+      }
+    }
+  }
+
+  // Calculate new ratings using OpenSkill with per-instance ratings
+  const statusRank: Record<string, number> = { w: 1, d: 2, l: 3 };
+  const ranks = commanderEntries.map(entry => statusRank[entry.status]);
+
+  const ordered = entryRatings.map(r => [r]);
+  const newMatrix = rate(ordered, { rank: ranks });
+
+  // Apply 3-deck penalty if needed (based on real commanders only)
+  const realCommanderCount = commanderEntries.filter(c => !c.isPhantom).length;
+  const penalty = realCommanderCount === 3 ? 0.9 : 1.0;
+
+  // Aggregate updates for duplicate commanders (like processDeckResults does)
+  const deckUpdates: Record<string, {
+    oldRating: Rating,
+    instances: { index: number, entry: any, newRating: Rating }[],
+    winCount: number,
+    lossCount: number,
+    drawCount: number
+  }> = {};
+
+  for (let i = 0; i < commanderEntries.length; i++) {
+    const entry = commanderEntries[i];
+    if (entry.isPhantom) continue;
+
+    const newR = newMatrix[i][0];
+
+    // Apply penalty
+    const penalizedRating: Rating = {
+      mu: 25 + (newR.mu - 25) * penalty,
+      sigma: newR.sigma
+    };
+
+    if (!deckUpdates[entry.normalizedName]) {
+      deckUpdates[entry.normalizedName] = {
+        oldRating: entryRatings[i], // All instances start from the same rating
+        instances: [],
+        winCount: 0,
+        lossCount: 0,
+        drawCount: 0
+      };
+    }
+
+    deckUpdates[entry.normalizedName].instances.push({
+      index: i,
+      entry,
+      newRating: penalizedRating
+    });
+
+    if (entry.status === 'w') deckUpdates[entry.normalizedName].winCount++;
+    else if (entry.status === 'l') deckUpdates[entry.normalizedName].lossCount++;
+    else if (entry.status === 'd') deckUpdates[entry.normalizedName].drawCount++;
+  }
+
+  // Update each unique commander once with aggregated results
+  for (const [normalizedName, update] of Object.entries(deckUpdates)) {
+    const oldR = update.oldRating;
+    const rec = commanderRecords[normalizedName];
+
+    // For duplicates, average the mu values and take the minimum sigma
+    // This properly aggregates multiple instances' rating changes
+    let aggregatedRating: Rating;
+    if (update.instances.length === 1) {
+      aggregatedRating = update.instances[0].newRating;
+    } else {
+      const avgMu = update.instances.reduce((sum, inst) => sum + inst.newRating.mu, 0) / update.instances.length;
+      const minSigma = Math.min(...update.instances.map(inst => inst.newRating.sigma));
+      aggregatedRating = { mu: avgMu, sigma: minSigma };
+    }
+
+    // Apply participation bonus (+1 Elo for playing ranked, max 5/day)
+    const effectiveDate = matchDate || new Date();
+    const deckGamesToday = await getDeckGamesOnDateBefore(normalizedName, effectiveDate, gameId);
+    const finalRating = applyParticipationBonus(aggregatedRating, deckGamesToday);
+
+    // Update win/loss/draw counts
+    rec.wins += update.winCount;
+    rec.losses += update.lossCount;
+    rec.draws += update.drawCount;
+
+    // Update database once per unique commander
+    await updateDeckRating(
+      normalizedName,
+      rec.displayName,
+      finalRating.mu,
+      finalRating.sigma,
+      rec.wins,
+      rec.losses,
+      rec.draws
+    );
+
+    // Log the commander rating change
+    try {
+      await logRatingChange({
+        targetType: 'deck',
+        targetId: normalizedName,
+        targetDisplayName: rec.displayName,
+        changeType: 'game',
+        oldMu: oldR.mu,
+        oldSigma: oldR.sigma,
+        oldElo: calculateElo(oldR.mu, oldR.sigma),
+        newMu: finalRating.mu,
+        newSigma: finalRating.sigma,
+        newElo: calculateElo(finalRating.mu, finalRating.sigma),
+        parameters: JSON.stringify({
+          gameId: gameId,
+          duplicateCount: update.instances.length,
+          results: update.instances.map(i => i.entry.status),
+          turnOrders: update.instances.map(i => i.entry.turnOrder),
+          phantomOpponents: phantomCount,
+          realOpponents: realCommanderCount - 1,
+          hybridPlayerDeckGame: true,
+          originalPlayers: update.instances.map(i => i.entry.originalPlayer)
+        })
+      });
+    } catch (auditError) {
+      logger.error('Error logging commander rating change to audit trail:', auditError);
+    }
+
+    // Record individual deck matches for each instance
+    for (const inst of update.instances) {
+      await recordDeckMatch(
+        `${matchId}-deck-${inst.entry.turnOrder}`,
+        gameId,
+        normalizedName,
+        rec.displayName,
+        inst.entry.status,
+        matchDate || new Date(),
+        finalRating.mu,
+        finalRating.sigma,
+        inst.entry.turnOrder
+      );
+    }
+  }
+}
+
+// Helper function to find available turn order for phantoms (improved logic)
+function findAvailableTurnOrderForPhantoms(existingEntries: any[]): number {
+  const usedTurnOrders = new Set(existingEntries.map(e => e.turnOrder));
+  
+  // Fill gaps in turn order first, then continue sequentially
+  for (let i = 1; i <= 4; i++) {
+    if (!usedTurnOrders.has(i)) {
+      return i;
+    }
+  }
+  
+  // This shouldn't happen with max 4 players, but fallback
+  return existingEntries.length + 1;
+}
+
+async function processDeckResults(
+  decks: DeckEntry[],
+  deckRatings: Record<string, Rating>,
+  deckRecords: Record<string, any>,
+  matchId: string,
+  gameId: string,
+  gameSequence: number,
+  submittedByAdmin: boolean,
+  submitterId: string,
+  replyMsg: any,
+  matchDate?: Date
+) {
+  const effectiveDate = matchDate || new Date();
+  // Note: Timewalk tracking is per-player based on lastPlayed timestamp
+  // Deck games don't affect player decay timers directly
+
+  // Calculate new ratings using OpenSkill
+  // Create per-instance rating copies to avoid shared references for duplicate decks
+  const statusRank: Record<string, number> = { w: 1, d: 2, l: 3 };
+  const ranks = decks.map(deck => statusRank[deck.status]);
+
+  const ordered = decks.map(deck => {
+    const r = deckRatings[deck.normalizedName];
+    return [rating({ mu: r.mu, sigma: r.sigma })]; // Fresh copy per instance
+  });
+  const newMatrix = rate(ordered, { rank: ranks });
+
+  // Apply 3-deck penalty if needed
+  const is3DeckGame = decks.length === 3;
+  if (is3DeckGame) {
+    for (let i = 0; i < newMatrix.length; i++) {
+      const newRating = newMatrix[i][0];
+      newMatrix[i][0] = {
+        mu: 25 + (newRating.mu - 25) * 0.9, // 10% penalty for 3-deck games
+        sigma: newRating.sigma
+      };
+    }
+  }
+
+  // Aggregate updates for duplicate decks
+  const deckUpdates: Record<string, {
+    instanceRatings: any[],
+    winCount: number,
+    lossCount: number,
+    drawCount: number,
+    instances: DeckEntry[]
+  }> = {};
+
+  // Process each deck instance
+  for (let i = 0; i < decks.length; i++) {
+    const deck = decks[i];
+    const newRating = newMatrix[i][0];
+
+    if (!deckUpdates[deck.normalizedName]) {
+      deckUpdates[deck.normalizedName] = {
+        instanceRatings: [],
+        winCount: 0,
+        lossCount: 0,
+        drawCount: 0,
+        instances: []
+      };
+    }
+
+    deckUpdates[deck.normalizedName].instanceRatings.push(newRating);
+    deckUpdates[deck.normalizedName].instances.push(deck);
+
+    // Count results for this deck
+    if (deck.status === 'w') deckUpdates[deck.normalizedName].winCount++;
+    else if (deck.status === 'l') deckUpdates[deck.normalizedName].lossCount++;
+    else if (deck.status === 'd') deckUpdates[deck.normalizedName].drawCount++;
+  }
+
+  // Update deck records and ratings
+  const results: string[] = [];
+
+  // Track final deck ratings (with participation bonus) for snapshot
+  const finalDeckRatings: Record<string, Rating> = {};
+
+  for (const [normalizedName, update] of Object.entries(deckUpdates)) {
+    const oldR = deckRatings[normalizedName];
+    // For duplicates, average mu and take min sigma to properly aggregate
+    let newR: Rating;
+    if (update.instanceRatings.length === 1) {
+      newR = update.instanceRatings[0];
+    } else {
+      const avgMu = update.instanceRatings.reduce((sum: number, r: any) => sum + r.mu, 0) / update.instanceRatings.length;
+      const minSigma = Math.min(...update.instanceRatings.map((r: any) => r.sigma));
+      newR = { mu: avgMu, sigma: minSigma };
+    }
+    const rec = deckRecords[normalizedName];
+    const displayName = update.instances[0].commander;
+
+    // Calculate Elos for display
+    const oldElo = calculateElo(oldR.mu, oldR.sigma);
+    const preBonusElo = calculateElo(newR.mu, newR.sigma);
+    const ratingChange = preBonusElo - oldElo;
+    const changeSign = ratingChange >= 0 ? '+' : '';
+
+    // Apply participation bonus (+1 Elo for playing ranked, max 5/day)
+    const deckGamesToday = await getDeckGamesOnDateBefore(normalizedName, effectiveDate, gameId);
+    newR = applyParticipationBonus(newR, deckGamesToday);
+
+    // Calculate final Elo for display
+    const finalElo = calculateElo(newR.mu, newR.sigma);
+
+    // Track final rating for snapshot
+    finalDeckRatings[normalizedName] = newR;
+
+    // Update win/loss/draw counts with aggregated results
+    rec.wins += update.winCount;
+    rec.losses += update.lossCount;
+    rec.draws += update.drawCount;
+
+    // Update database
+    await updateDeckRating(
+      normalizedName,
+      displayName,
+      newR.mu,
+      newR.sigma,
+      rec.wins,
+      rec.losses,
+      rec.draws
+    );
+
+    // Log the deck rating change for audit trail
+    try {
+      await logRatingChange({
+        targetType: 'deck',
+        targetId: normalizedName,
+        targetDisplayName: displayName,
+        changeType: 'game',
+        oldMu: oldR.mu,
+        oldSigma: oldR.sigma,
+        oldElo: calculateElo(oldR.mu, oldR.sigma),
+        newMu: newR.mu,
+        newSigma: newR.sigma,
+        newElo: calculateElo(newR.mu, newR.sigma),
+        parameters: JSON.stringify({
+          gameId: gameId,
+          duplicateCount: update.instances.length,
+          results: update.instances.map(i => i.status),
+          turnOrders: update.instances.map(i => i.turnOrder),
+          opponents: decks.length - update.instances.length,
+          is3DeckPenalty: decks.length === 3,
+          deckOnlyMode: true
+        })
+      });
+    } catch (auditError) {
+      logger.error('Error logging deck rating change to audit trail:', auditError);
+    }
+    
+    // Record individual matches for each instance
+    for (const instance of update.instances) {
+      await recordDeckMatch(
+        `${matchId}-${instance.turnOrder}`, // Unique match ID for each instance
+        gameId,
+        normalizedName,
+        displayName,
+        instance.status,
+        effectiveDate,
+        newR.mu,
+        newR.sigma,
+        instance.turnOrder
+      );
+    }
+
+    const duplicateNote = update.instances.length > 1 ? ` (${update.instances.length} copies)` : '';
+    const instanceResults = update.instances.map(i => `Turn ${i.turnOrder}: ${i.status.toUpperCase()}`).join(', ');
+
+    results.push(
+      `**${displayName}${duplicateNote}**\n` +
+      `Instances: ${instanceResults}\n` +
+      `Elo: ${oldElo} → ${preBonusElo} (${changeSign}${ratingChange})${finalElo !== preBonusElo ? ' + 1 (participation)' : ' + 0 (daily bonus limit reached)'} = **${finalElo}**\n` +
+      `Mu: ${oldR.mu.toFixed(2)} → ${newR.mu.toFixed(2)} | Sigma: ${oldR.sigma.toFixed(2)} → ${newR.sigma.toFixed(2)}\n` +
+      `W/L/D: ${rec.wins}/${rec.losses}/${rec.draws}`
+    );
+  }
+
+  // Update deck matches with sequence number
+  await updateMatchesWithSequence(gameId, gameSequence, 'deck');
+
+  // Build complete deck match data for snapshot (needed for proper undo/redo)
+  const deckMatchDataForSnapshot: any[] = [];
+  for (const normalizedName of Object.keys(deckUpdates)) {
+    const update = deckUpdates[normalizedName];
+    const displayName = update.instances[0].commander;
+    for (const instance of update.instances) {
+      deckMatchDataForSnapshot.push({
+        id: `${matchId}-${instance.turnOrder}`,
+        gameId: gameId,
+        deckNormalizedName: normalizedName,
+        deckDisplayName: displayName,
+        status: instance.status,
+        matchDate: effectiveDate.toISOString(),
+        mu: finalDeckRatings[normalizedName].mu,
+        sigma: finalDeckRatings[normalizedName].sigma,
+        turnOrder: instance.turnOrder,
+        submittedByAdmin: submittedByAdmin,
+        submittedBy: submitterId,
+        assignedPlayer: null  // Deck games don't track assigned players
+      });
+    }
+  }
+
+  // Save deck match snapshot for undo/redo functionality
+  await saveMatchSnapshot({
+    matchId,
+    gameId,
+    gameSequence,
+    gameType: 'deck',
+    matchData: deckMatchDataForSnapshot,
+    before: Object.keys(deckUpdates).map(normalizedName => {
+      const rec = deckRecords[normalizedName];
+      const update = deckUpdates[normalizedName];
+      return {
+        normalizedName,
+        displayName: update.instances[0].commander,
+        mu: deckRatings[normalizedName].mu,
+        sigma: deckRatings[normalizedName].sigma,
+        wins: rec.wins - update.winCount,
+        losses: rec.losses - update.lossCount,
+        draws: rec.draws - update.drawCount,
+        turnOrder: update.instances[0].turnOrder
+      };
+    }),
+    after: Object.keys(deckUpdates).map(normalizedName => {
+      const rec = deckRecords[normalizedName];
+      const update = deckUpdates[normalizedName];
+      return {
+        normalizedName,
+        displayName: update.instances[0].commander,
+        mu: finalDeckRatings[normalizedName].mu,
+        sigma: finalDeckRatings[normalizedName].sigma,
+        wins: rec.wins,
+        losses: rec.losses,
+        draws: rec.draws,
+        turnOrder: update.instances[0].turnOrder
+      };
+    })
+  });
+
+  const resultEmbed = new EmbedBuilder()
+    .setTitle('✅ Deck battle confirmed! Results are now final!')
+    .setDescription(`🎯 **Game ID: ${gameId}**\n\n` + results.join('\n\n'))
+    .setColor(0x4BB543);
+
+  const chan = replyMsg.channel as TextChannel;
+  await chan.send({ embeds: [resultEmbed] });
+}
