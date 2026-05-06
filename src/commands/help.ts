@@ -1,0 +1,200 @@
+import {
+  SlashCommandBuilder,
+  ChatInputCommandInteraction,
+  EmbedBuilder,
+} from 'discord.js';
+import { config } from '../config.js';
+import { logger } from '../utils/logger.js';
+
+export const data = new SlashCommandBuilder()
+  .setName('help')
+  .setDescription('Show help for PokemonSkill commands')
+  .addStringOption(option =>
+    option
+      .setName('section')
+      .setDescription('Select a help topic')
+      .setRequired(true)
+      .addChoices(
+        { name: 'Info', value: 'info' },
+        { name: 'Player Commands', value: 'player' },
+        { name: 'Deck/Team Commands', value: 'deck' },
+        { name: 'Stats Commands', value: 'stats' },
+        { name: 'Admin Commands', value: 'admin' },
+        { name: 'Tips & Tricks', value: 'tips' },
+        { name: 'Credits', value: 'credits' }
+      )
+  );
+
+export async function execute(interaction: ChatInputCommandInteraction) {
+  const userId = interaction.user.id;
+  const section = interaction.options.getString('section', true);
+  const isAdmin = config.admins.includes(userId);
+
+  const embed = new EmbedBuilder()
+    .setTitle('PokemonSkill Help')
+    .setColor('Blue');
+
+  switch (section) {
+    case 'info':
+      embed
+        .setDescription('**PokemonSkill** is an OpenSkill-based 1v1 rating system for Pokémon TCG Pocket and Pokémon Showdown.')
+        .addFields(
+          { name: 'Mu & Sigma', value: 'Mu represents skill. Sigma is confidence in the rating.' },
+          { name: 'Elo Conversion', value: '`Elo = 1000 + 25 * (mu - 3 * sigma)`' },
+          { name: 'Turn Order Tracking', value: 'Optional — track who went first vs. second (1 = first, 2 = second).' },
+          { name: 'Dual Systems', value: 'Separate ranking systems for players and registered decks/teams (e.g. "Mewtwo Hyper Offense", "All Psychic").' },
+          { name: 'Qualification', value: 'Minimum 5 games required to appear in official rankings.' },
+          { name: 'Game Modes', value: '1v1 only. Three valid outcomes: P1 wins / P2 wins / draw.' },
+          { name: 'Free-Form Names', value: 'Register any deck or team name you like — no external validation. Works for both TCG Pocket decks and Showdown teams.' },
+          { name: 'Participation Bonus', value: 'Both players receive +1 Elo for every ranked game played (max 5 per day).' },
+          { name: 'Rating Decay', value: `After ${config.decayStartDays} days of inactivity, players lose -1 Elo per day (stops at 1050 Elo). Decay only applies to players who have played at least 1 ranked game.` }
+        );
+      break;
+
+    case 'player':
+      embed.setDescription('**Player Ranking Commands:**')
+        .addFields(
+          { name: '/rank', value: 'Submit a 1v1 game result (2 players, w/l/d only). Can include the deck/team name each player used. Optional turn order tracking with reactions OR inline (e.g., `@user w 1` = went first and won). Also supports deck-only mode when no players are mentioned.' },
+          { name: '/list [count]', value: 'Show top N players (default 100, max 200, includes ties). Shows qualification status.' },
+          { name: '/view player:@user', value: 'View detailed player stats: rating, rank, W/L/D record, top 5 decks/teams, and turn order performance.' },
+          { name: '/predict [@users...]', value: 'Predict win chances for players/decks using Elo, turn order, and hybrid predictions. Shows overall turn order win% if no input.' },
+          { name: '/set deck:NAME', value: 'Set your default deck/team for future games. Use `gameid:ABC123` for a specific game, `gameid:allgames` for all games.' }
+        );
+      break;
+
+    case 'deck':
+      embed.setDescription('**Deck/Team Ranking Commands:**')
+        .addFields(
+          { name: '/rank (deck mode)', value: 'When no @users are mentioned, /rank works as deck-only mode — ORDER MATTERS! First entry = went first, second = went second. Format: `deck-name w/l/d deck-name w/l/d` (exactly two entries).' },
+          { name: '/list type:decks [count]', value: 'Show top N decks/teams (default 100, max 200, includes ties). Displays Elo and qualification status.' },
+          { name: '/view commander:NAME', value: 'View deck/team stats: rating, rank, W/L/D record, win rate, and turn order performance.' }
+        );
+      break;
+
+    case 'stats':
+      embed.setDescription('**Statistics & Information Commands:**')
+        .addFields(
+          { name: '/view', value: 'Comprehensive league overview: total players, games played, qualification rates, and activity metrics. (Same as `/view type:league`)' },
+          { name: '/view gameid:ABC123', value: 'View detailed game information: both players, rating changes, W/L/D changes, decks/teams, and turn order.' },
+          { name: '/predict', value: 'General turn order statistics across all players when used without arguments.' }
+        );
+      break;
+
+    case 'admin':
+      if (!isAdmin) {
+        embed.setDescription('Admin commands are only available to bot administrators.');
+        break;
+      }
+      embed.setDescription('**Admin Commands:**')
+        .addFields(
+          {
+            name: 'Unified Match Management',
+            value: '`/undo [gameid]` - Revert match/set/decay (latest or specific game ID)\n' +
+                   '`/redo` - Reapply most recent undone operation\n'
+          },
+          {
+            name: 'Game Injection',
+            value: '`/rank aftergame:GAMEID` - Inject player game after specified game ID\n' +
+                   '*Automatically recalculates all ratings chronologically*'
+          },
+          {
+            name: 'Player Management',
+            value: '`/restrict @user` - Ban user from ranked games\n' +
+                   '`/vindicate @user` - Unban user and clear suspicion\n' +
+                   '`/reanimate @user` - Remove suspicion exemption'
+          },
+          {
+            name: 'System Management',
+            value: '`/backup` - Download database backup via DM\n' +
+                   '`/snap` - Delete all unconfirmed game messages (both player and deck games)\n' +
+                   '`/set @user|deck-name parameters` - Directly modify player or deck ratings\n' +
+                   'Parameters: `mu:25.0 sigma:8.3 elo:1200 wld:3/4/5` (any combination, any order)'
+          },
+          {
+            name: 'History & Data Export (Admin Only)',
+            value: '`/print [target]` - Export detailed history to text file:\n' +
+                   '  • No target: Complete league history\n' +
+                   '  • `target:admin`: Admin activity report\n' +
+                   '  • `target:decay`: All rating decay logs\n' +
+                   '  • `target:setrank`: All manual rating adjustments\n' +
+                   '  • `target:undo`: All undo/redo operations\n' +
+                   '  • `target:@user`: Specific player history\n' +
+                   '  • `target:deck-name`: Specific deck/team history'
+          },
+          {
+            name: 'Season Management',
+            value: '`/thanossnap` - End season, show rankings, reset data\n'
+          },
+          {
+            name: 'Testing & Development (Admin Only)',
+            value: '`/timewalk [days]` - Simulate time passing for decay testing\n' +
+                   '• Uses per-player virtual clock tracking\n' +
+                   '• Players who play mid-timewalk won\'t decay for pre-play time\n' +
+                   '• Virtual time resets on rating recalculation or bot restart\n' +
+                   '*For testing purposes only - not recommended for production use*'
+          },
+          {
+            name: 'Database Cleanup',
+            value: 'Automatic cleanup runs after `/undo`, `/redo`, and `/set` game changes:\n' +
+                   '• Removes players/decks with 0/0/0 records in active games\n' +
+                   '• `/redo` auto-recreates any removed players'
+          }
+        );
+      break;
+
+    case 'tips':
+      embed.setDescription('**Tips & Tricks:**')
+        .addFields(
+          {
+            name: 'Game Injection (Admin)',
+            value: '`/rank aftergame:start` or `aftergame:0` - Inject a game **before** all other games (very first game of the league)\n' +
+                   '`/rank aftergame:GAMEID` - Inject a game after a specific game. The timestamp is automatically set to the midway point between that game and the next one.\n' +
+                   '*All injected games trigger a full rating recalculation.*'
+          },
+          {
+            name: 'Deck/Team Assignment',
+            value: '`/set deck:nocommander gameid:ABC123` - Remove a deck/team assignment from a specific game\n' +
+                   '`/set deck:nocommander gameid:allgames` - Remove deck/team from all games for a player\n' +
+                   '`/set deck:NAME` - Set your default deck/team for future games\n' +
+                   '`/set deck:nocommander` - Remove your default deck/team'
+          },
+          {
+            name: 'Phantom Decks',
+            value: 'In a player game, if one player has a deck/team assigned and the other doesn\'t, the system creates a "phantom" deck for the unassigned slot. ' +
+                   'Phantoms inherit the game result (win/loss/draw) of the player they represent, so deck ratings stay accurate even in mixed games.\n' +
+                   'You can also use `phantom` as a participant in `/predict` to fill the opposing seat with a default 1000 Elo opponent.'
+          },
+          {
+            name: 'Duplicate Decks',
+            value: 'Both players can use the same deck/team in a 1v1. The system handles duplicate names by giving each instance its own rating calculation, then aggregating the results.'
+          },
+          {
+            name: 'Game Modification (Admin)',
+            value: '`/set gameid:ABC123 active:false` - Deactivate a game (removes it from ratings)\n' +
+                   '`/set gameid:ABC123 active:true` - Reactivate a game\n' +
+                   '`/set gameid:ABC123 results:@user1 w @user2 l` - Overwrite game results\n' +
+                   '*All modifications trigger a full recalculation of the entire season.*'
+          },
+          {
+            name: 'Undo/Redo',
+            value: '`/undo` - Revert the most recent operation (game, /set change, or decay cycle)\n' +
+                   '`/redo` - Reapply the most recently undone operation\n' +
+                   '*Preserves decay timers - undoing yesterday\'s game won\'t reset the decay clock.*'
+          }
+        );
+      break;
+
+    case 'credits':
+      embed.setDescription([
+        '**👨‍💻 PokemonSkill maintainer:** isleep2late',
+        '**🧬 Forked from:** [cEDHSkill](https://github.com/isleep2late/cEDHSkill) by isleep2late',
+        '**🧮 OpenSkill:** https://github.com/philihp/openskill.js',
+        '**📊 Research:** https://www.csie.ntu.edu.tw/~cjlin/papers/online_ranking/online_journal.pdf',
+        '**📖 Thank you to LLMs** for assisting with adapting the code.',
+        '**🙏 Built for the Pokémon TCG Pocket and Pokémon Showdown communities** — battle on!'
+      ].join('\n'));
+      break;
+  }
+
+  await interaction.reply({ embeds: [embed] });
+}

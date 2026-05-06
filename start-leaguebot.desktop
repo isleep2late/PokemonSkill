@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Pokémon Skill Bot
+Comment=Start the Pokémon Skill Bot
+Type=Application
+Terminal=true
+Exec=bash -c 'cd "$(dirname "%k")" && ./start-leaguebot.sh --keep-open'
+Icon=utilities-terminal
+Categories=Game;

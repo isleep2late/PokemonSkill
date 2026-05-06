@@ -1,0 +1,32 @@
+{
+  "name": "pokemon-skill-bot",
+  "version": "0.03",
+  "description": "Discord bot for 1v1 Pokémon ranked games (TCG Pocket and Showdown) using OpenSkill",
+  "type": "module",
+  "main": "dist/bot.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/loader.js",
+    "register-commands": "node dist/register-commands.js",
+    "commands:register": "tsx src/register-commands.ts",
+    "commands:list": "tsx src/list-commands.ts",
+    "commands:clear-other": "tsx src/clear-other-servers.ts",
+    "dev": "tsx src/loader.ts"
+  },
+  "author": "isleep2late",
+  "license": "MIT",
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "openskill": "^4.1.0",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^5.1.7",
+    "node-cron": "^3.0.2",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.0",
+    "typescript": "^5.8.3",
+    "@types/node-cron": "^3.0.2",
+    "@types/node": "^20.10.0"
+  }
+}
