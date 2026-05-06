@@ -1,4 +1,4 @@
-# PokemonSkill v0.03 Beta
+# PokemonSkill v0.01 Beta
 
 A Discord bot for ranking 1v1 Pokémon battles — both **Pokémon TCG Pocket** and **Pokémon Showdown** — using [OpenSkill](https://github.com/philihp/openskill.js) (Weng-Lin Bayesian Rating).
 
