@@ -1,0 +1,692 @@
+# PokemonSkill patches for rank.ts and set.ts
+#
+# How to use:
+#   1. Make sure you have copied rank.ts and set.ts from cEDHSkill into
+#      this repo (paths: src/commands/rank.ts, src/commands/set.ts).
+#   2. From the repo root, run:    git apply pokemonskill.patch
+#   3. Or if not in a git repo:    patch -p1 < pokemonskill.patch
+#
+diff -u a/src/commands/rank.ts b/src/commands/rank.ts
+--- a/src/commands/rank.ts	2026-05-04 00:30:55.210471211 +0000
++++ b/src/commands/rank.ts	2026-05-04 03:48:33.640415785 +0000
+@@ -92,12 +92,12 @@
+   return /^[A-Z0-9]{6,8}$/.test(gameId);
+ }
+ 
+-  static validateTurnOrder(turnOrder: number, maxPlayers: number = 4): boolean {
++  static validateTurnOrder(turnOrder: number, maxPlayers: number = 2): boolean {
+     return Number.isInteger(turnOrder) && turnOrder >= 1 && turnOrder <= maxPlayers;
+   }
+ 
+   static validateCommanderName(commanderName: string): boolean {
+-    // Basic validation - alphanumeric, hyphens, and spaces only
++    // Free-form deck/team name (Pokémon TCG Pocket deck or Showdown team)
+     return /^[a-zA-Z0-9\s\-',.]+$/.test(commanderName) && commanderName.length >= 2 && commanderName.length <= 100;
+   }
+ 
+@@ -105,15 +105,14 @@
+     return ['w', 'l', 'd'].includes(result.toLowerCase());
+   }
+ 
+-  static validatePlayerCount(count: number, isCEDHMode: boolean = true): boolean {
+-    if (isCEDHMode) {
+-      return count === 4; // cEDH mode requires exactly 4 players
+-    }
+-    return count >= 2 && count <= 4;
++  static validatePlayerCount(count: number, _isCEDHMode: boolean = true): boolean {
++    // PokemonSkill is strictly 1v1.
++    return count === 2;
+   }
+ 
+   static validateDeckCount(count: number): boolean {
+-    return count >= 3 && count <= 4;
++    // 1v1 deck-vs-deck matches.
++    return count === 2;
+   }
+ 
+   static validateResultCombination(results: string[]): { valid: boolean; error?: string } {
+@@ -121,34 +120,28 @@
+     const drawCount = results.filter(r => r === 'd').length;
+     const lossCount = results.filter(r => r === 'l').length;
+ 
+-    // Must have at least one result
+     if (results.length === 0) {
+       return { valid: false, error: 'No results provided' };
+     }
+ 
+-    // All results must be w, l, or d
+     if (winCount + drawCount + lossCount !== results.length) {
+       return { valid: false, error: 'Invalid result format. Use only w (win), l (loss), or d (draw)' };
+     }
+ 
+-    // cEDH validation: ONLY allow these two scenarios:
+-      // 1. Exactly 1 winner and 3 losers (no draws)
+-      // 2. All 4 draws (no winners, no losers)
+-  
+-      // Scenario 1: 1 winner, 3 losers, 0 draws
+-      if (winCount === 1 && lossCount === 3 && drawCount === 0) {
+-        return { valid: true };
+-      }
+-  
+-      // Scenario 2: 0 winners, 0 losers, 4 draws
+-      if (winCount === 0 && lossCount === 0 && drawCount === 4) {
+-        return { valid: true };
+-      }
+-
+-      // Any other combination is invalid
+-      return { valid: false, error: 'Invalid result combination. Must be either: 1 winner + 3 losers, or 4 draws' };
++    // PokemonSkill (1v1) — only three valid outcomes:
++    //   1. P1 wins, P2 loses (1w + 1l)
++    //   2. P1 loses, P2 wins (1w + 1l, just reversed)
++    //   3. Draw (2d)
++    if (winCount === 1 && lossCount === 1 && drawCount === 0) {
++      return { valid: true };
++    }
++    if (winCount === 0 && lossCount === 0 && drawCount === 2) {
++      return { valid: true };
+     }
+ 
++    return { valid: false, error: 'Invalid result combination. Must be either: 1 winner + 1 loser, or 2 draws' };
++  }
++
+ 
+   static validateTurnOrders(turnOrders: number[]): { valid: boolean; error?: string } {
+     const provided = turnOrders.filter(t => t > 0);
+@@ -160,7 +153,7 @@
+ 
+     for (const turnOrder of provided) {
+       if (!this.validateTurnOrder(turnOrder)) {
+-        return { valid: false, error: `Invalid turn order: ${turnOrder}. Must be between 1 and 4` };
++        return { valid: false, error: `Invalid turn order: ${turnOrder}. Must be 1 (went first) or 2 (went second)` };
+       }
+     }
+ 
+@@ -211,94 +204,15 @@
+   }
+ }
+ 
+-// Enhanced commander validation with retries and caching
++// Free-form deck/team validation. PokemonSkill accepts any user-supplied deck or
++// team name (e.g. "Mewtwo Hyper Offense", "All Psychic"), so this only enforces
++// basic format/length rules — there's no external database to check against.
+ class CommanderValidator {
+-  private static cache = new Map<string, boolean>();
+-  private static cacheExpiry = new Map<string, number>();
+-  private static readonly CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours
+-  private static pendingValidations = new Map<string, Promise<boolean>>();
+-
+   static async validateCommander(commanderName: string): Promise<{ valid: boolean; error?: string }> {
+-    try {
+-      // Input validation
+-      if (!InputValidator.validateCommanderName(commanderName)) {
+-        return { valid: false, error: 'Invalid commander name format' };
+-      }
+-
+-      const normalizedName = normalizeCommanderName(commanderName);
+-      
+-      // Check cache first
+-      const cached = this.getCached(normalizedName);
+-      if (cached !== null) {
+-        return { valid: cached };
+-      }
+-
+-      // Check if validation is already in progress
+-      if (this.pendingValidations.has(normalizedName)) {
+-        const result = await this.pendingValidations.get(normalizedName)!;
+-        return { valid: result };
+-      }
+-
+-      // Start new validation
+-      const validationPromise = this.performValidation(normalizedName);
+-      this.pendingValidations.set(normalizedName, validationPromise);
+-
+-      try {
+-        const isValid = await validationPromise;
+-        this.setCached(normalizedName, isValid);
+-        return { valid: isValid };
+-      } finally {
+-        this.pendingValidations.delete(normalizedName);
+-      }
+-    } catch (error) {
+-      logger.error(`Commander validation error for ${commanderName}:`, error);
+-      return { valid: false, error: 'Validation service temporarily unavailable' };
++    if (!InputValidator.validateCommanderName(commanderName)) {
++      return { valid: false, error: 'Invalid deck/team name. Use 2–100 letters, digits, spaces, hyphens, apostrophes, commas, or periods.' };
+     }
+-  }
+-
+-  private static getCached(normalizedName: string): boolean | null {
+-    const expiry = this.cacheExpiry.get(normalizedName);
+-    if (expiry && Date.now() < expiry) {
+-      return this.cache.get(normalizedName) || null;
+-    }
+-    return null;
+-  }
+-
+-  private static setCached(normalizedName: string, isValid: boolean): void {
+-    this.cache.set(normalizedName, isValid);
+-    this.cacheExpiry.set(normalizedName, Date.now() + this.CACHE_DURATION);
+-  }
+-
+-  private static async performValidation(normalizedName: string): Promise<boolean> {
+-    const maxRetries = 3;
+-    const retryDelay = 1000;
+-
+-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+-      try {
+-        const controller = new AbortController();
+-        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+-
+-        const response = await fetch(`https://edhrec.com/commanders/${normalizedName}`, {
+-          method: 'HEAD',
+-          signal: controller.signal,
+-          headers: {
+-            'User-Agent': 'cEDHSkill-Bot/1.0'
+-          }
+-        });
+-
+-        clearTimeout(timeoutId);
+-        return response.status === 200;
+-      } catch (error) {
+-        logger.warn(`Commander validation attempt ${attempt} failed for ${normalizedName}:`, error);
+-        
+-        if (attempt < maxRetries) {
+-          await new Promise(resolve => setTimeout(resolve, retryDelay * attempt));
+-        }
+-      }
+-    }
+-
+-    logger.error(`All validation attempts failed for ${normalizedName}`);
+-    return false;
++    return { valid: true };
+   }
+ }
+ 
+@@ -851,7 +765,7 @@
+ // Helper function to rebuild turn order data from current reactions
+ async function buildTurnOrderFromReactions(message: any, players: PlayerEntry[]): Promise<Map<string, number>> {
+   const turnOrderData = new Map<string, number>();
+-  const turnOrderEmojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣'];
++  const turnOrderEmojis = ['1️⃣', '2️⃣'];
+   const validUserIds = new Set(players.map(p => p.userId));
+   
+   try {
+@@ -958,7 +872,7 @@
+     .setFooter({ text: 'Player rankings updated after game injection/recalculation' });
+ 
+   const deckEmbed = new EmbedBuilder()
+-    .setTitle('🎃 Updated Top 50 Decks')
++    .setTitle('🎃 Updated Top 50 Decks/Teams')
+     .setDescription(deckDescription.length > 0 ? deckDescription.join('\n') : 'No decks found.')
+     .setColor('Purple')
+     .setFooter({ text: 'Deck rankings updated after game injection/recalculation' });
+@@ -1110,11 +1024,11 @@
+ 
+ export const data = new SlashCommandBuilder()
+   .setName('rank')
+-  .setDescription('Submit game results - supports players, commanders, or both!')
++  .setDescription('Submit a 1v1 game result — players, decks/teams, or both!')
+   .addStringOption(option =>
+     option
+       .setName('results')
+-      .setDescription('Results string - can include @users and/or commander names with w/l/d')
++      .setDescription('Results string - can include @users and/or deck/team names with w/l/d')
+       .setRequired(true)
+   )
+   .addStringOption(option =>
+@@ -1232,7 +1146,7 @@
+       continue;
+     }
+     
+-    // Check if it's a commander name (supports multi-word names like "Ashling, Flame Dancer")
++    // Check if it's a deck/team name (supports multi-word names like "Mewtwo Hyper Offense")
+     if (/^[a-zA-Z][a-zA-Z0-9\-',.]*$/.test(token) && token.length > 1 && !current.commander) {
+       // Make sure it's not another user mention coming up
+       const nextToken = tokens[i + 1];
+@@ -1298,9 +1212,9 @@
+     .join(', ');
+   
+   await interaction.editReply({
+-    content: `⚠️ Invalid format: Each player can only have ONE commander assigned per game.\n` +
+-             `The following players have multiple commanders: ${problematicPlayers}\n\n` +
+-             `Correct format: \`@user commander-name w\` or \`@user w commander-name\`\n` +
++    content: `⚠️ Invalid format: Each player can only have ONE deck/team assigned per game.\n` +
++             `The following players have multiple deck/team names: ${problematicPlayers}\n\n` +
++             `Correct format: \`@user deck-name w\` or \`@user w deck-name\`\n` +
+              `Incorrect format: \`@user deck1 deck2 w\` or \`@user deck1 w deck2\``
+   });
+   return;
+@@ -1390,25 +1304,22 @@
+   if (parsed === null && !processedTokens.has(token)) {
+     await interaction.editReply({
+       content: `⚠️ Invalid token detected: "${token}"\n` +
+-               'Only use: user mentions (@user), commander names, results (w/l/d), and turn orders (1-4).\n' +
+-               'Valid examples: `w`, `2`, `3w`, `l1`, but NOT `0w`, `5l`, `ww`, `2w3`'
++               'Only use: user mentions (@user), deck/team names, results (w/l/d), and turn orders (1-2).\n' +
++               'Valid examples: `w`, `2`, `1w`, `l2`, but NOT `0w`, `3l`, `ww`, `1w2`'
+     });
+     return;
+   }
+ }
+ 
+-  // SMART TURN ORDER DEDUCTION
++  // SMART TURN ORDER DEDUCTION (1v1): if exactly one of two players supplied a
++  // turn order, assign the remaining slot (1 or 2) to the other player.
+   const playersWithTurnOrder = players.filter(p => p.turnOrder !== undefined);
+-  if (playersWithTurnOrder.length === 3 && players.length === 4) {
+-    const providedTurnOrders = new Set(playersWithTurnOrder.map(p => p.turnOrder!));
+-    const allTurnOrders = [1, 2, 3, 4];
+-    const missingTurnOrder = allTurnOrders.find(t => !providedTurnOrders.has(t));
+-    
+-    if (missingTurnOrder) {
+-      const playerWithoutTurnOrder = players.find(p => p.turnOrder === undefined);
+-      if (playerWithoutTurnOrder) {
+-        playerWithoutTurnOrder.turnOrder = missingTurnOrder;
+-      }
++  if (playersWithTurnOrder.length === 1 && players.length === 2) {
++    const provided = playersWithTurnOrder[0].turnOrder!;
++    const missingTurnOrder = provided === 1 ? 2 : 1;
++    const playerWithoutTurnOrder = players.find(p => p.turnOrder === undefined);
++    if (playerWithoutTurnOrder) {
++      playerWithoutTurnOrder.turnOrder = missingTurnOrder;
+     }
+   }
+ 
+@@ -1419,14 +1330,14 @@
+     return;
+   }
+ 
+-  // --- CEDH MODE: enforce 4 players, only w/l/d, support optional turn order numbers ---
++  // --- POKÉMON 1v1 MODE: enforce exactly 2 players, only w/l/d, optional turn order ---
+   const numPlayers = players.length;
+-  const isCEDHMode = true; // Set to false to disable cEDH mode restrictions
+-  
++  const isCEDHMode = true; // Retained internal flag name; controls 1v1-mode restrictions.
++
+   if (isCEDHMode) {
+-    if (numPlayers !== 4) {
++    if (numPlayers !== 2) {
+       await interaction.editReply({
+-        content: '⚠️ Only 4-player games are supported in cEDH mode.'
++        content: '⚠️ PokemonSkill only supports 1v1 (2-player) games.'
+       });
+       return;
+     }
+@@ -1449,21 +1360,19 @@
+       return;
+     }
+ 
+-    // Validate turn order numbers (if provided)
++    // Validate turn order numbers (if provided): 1 = went first, 2 = went second.
+     const providedTurnOrders = players
+       .filter(p => p.turnOrder !== undefined)
+       .map(p => p.turnOrder!);
+ 
+     if (providedTurnOrders.length > 0) {
+-      // Check for valid range (1-4)
+-      if (providedTurnOrders.some(t => t < 1 || t > 4)) {
++      if (providedTurnOrders.some(t => t < 1 || t > 2)) {
+         await interaction.editReply({
+-          content: '⚠️ Turn order numbers must be between 1 and 4.'
++          content: '⚠️ Turn order must be 1 (went first) or 2 (went second).'
+         });
+         return;
+       }
+ 
+-      // Check for duplicates
+       const uniqueTurnOrders = new Set(providedTurnOrders);
+       if (uniqueTurnOrders.size !== providedTurnOrders.length) {
+         await interaction.editReply({
+@@ -1477,26 +1386,24 @@
+     const drawCount = players.filter(p => p.status === 'd').length;
+     const lossCount = players.filter(p => p.status === 'l').length;
+ 
+-// Enforce cEDH rules: ONLY 1 winner + 3 losers OR 4 draws
+-if (winCount === 1 && lossCount === 3 && drawCount === 0) {
+-  // Valid: 1 winner, 3 losers
+-} else if (winCount === 0 && lossCount === 0 && drawCount === 4) {
+-  // Valid: 4-way draw
+-} else {
+-  await interaction.editReply({
+-    content: '⚠️ Invalid result combination for cEDH format. Must be either: 1 winner + 3 losers, or 4 draws.'
+-  });
+-  return;
+-}
++    // Three legal outcomes for 1v1: P1 wins / P2 wins / draw.
++    if (winCount === 1 && lossCount === 1 && drawCount === 0) {
++      // Valid: one winner, one loser
++    } else if (winCount === 0 && lossCount === 0 && drawCount === 2) {
++      // Valid: draw (both players)
++    } else {
++      await interaction.editReply({
++        content: '⚠️ Invalid result combination for 1v1 format. Must be either: 1 winner + 1 loser, or 2 draws.'
++      });
++      return;
++    }
+   }
+ 
+-  // Validate commanders (if any are assigned)
++  // Free-form deck/team name validation (no external lookup).
+   const playersWithCommanders = players.filter(p => p.commander);
+   if (playersWithCommanders.length > 0) {
+-    // Get unique commanders for validation
+     const uniqueCommanders = [...new Set(playersWithCommanders.map(p => p.normalizedCommanderName!))];
+ 
+-    // Validate all unique commanders exist on EDHREC
+     const validationResults = await Promise.all(
+       uniqueCommanders.map(async (normalizedName) => ({
+         normalizedName,
+@@ -1511,8 +1418,8 @@
+       ).filter(Boolean).join(', ');
+ 
+       await interaction.editReply({
+-        content: `⚠️ The following commanders could not be found on EDHREC: ${invalidNames}\n` +
+-                 'Please check the spelling and use the format from EDHREC URLs (e.g., "atraxa-praetors-voice").'
++        content: `⚠️ Invalid deck/team name format: ${invalidNames}\n` +
++                 'Names must be 2–100 characters using letters, digits, spaces, hyphens, apostrophes, commas, or periods.'
+       });
+       return;
+     }
+@@ -1598,7 +1505,7 @@
+     additionalInfo += `\n\n🔢 **Turn Order Assigned:**\n${turnOrderSummary.join('\n')}`;
+   }
+   if (commanderSummary.length > 0) {
+-    additionalInfo += `\n\n🎃 **Commanders Assigned:**\n${commanderSummary.join('\n')}`;
++    additionalInfo += `\n\n🎃 **Decks/Teams Assigned:**\n${commanderSummary.join('\n')}`;
+   }
+ 
+   // CHECK FOR PLAYERS ALREADY IN LIMBO (skip bot)
+@@ -1653,7 +1560,7 @@
+           name: `${userNames[p.userId]}${commanderDisplay}${turnOrderDisplay}${p.team ? ` (${p.team})` : ''}`,
+           value:
+             `Result: ${p.status?.toUpperCase() ?? '❓'}\n` +
+-            (p.commander ? `Commander: ${p.commander}\n` : '') +
++            (p.commander ? `Deck/Team: ${p.commander}\n` : '') +
+             (p.turnOrder ? `Turn Order: ${p.turnOrder}\n` : '') +
+             `Elo: ${calculateElo(r.mu, r.sigma)}\n` +
+             `Mu: ${r.mu.toFixed(2)}\n` +
+@@ -1686,7 +1593,7 @@
+   // Handle turn order collection
+   const providedTurnOrders = new Set(players.filter(p => p.turnOrder).map(p => p.turnOrder!));
+   const missingTurnOrders = [1, 2, 3, 4].filter(t => !providedTurnOrders.has(t));
+-  const turnOrderEmojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣'];
++  const turnOrderEmojis = ['1️⃣', '2️⃣'];
+   
+   if (missingTurnOrders.length > 0) {
+     try {
+@@ -1781,7 +1688,7 @@
+ turnOrderCollector.on('collect', async (reaction, user) => {
+   // Always remove unauthorized reactions immediately
+   const validUsers = new Set(players.map(p => p.userId));
+-  const turnOrderEmojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣'];
++  const turnOrderEmojis = ['1️⃣', '2️⃣'];
+   
+   if (!validUsers.has(user.id) || !turnOrderEmojis.includes(reaction.emoji.name!)) {
+     try {
+@@ -1899,15 +1806,15 @@
+   const nonAdminEmbed = new EmbedBuilder()
+     .setTitle(`⚔️ Game Results Pending Confirmation`)
+     .setDescription(
+-      `**Players must confirm their participation:**\n` +
+-      '• **FIRST**: Click 1️⃣, 2️⃣, 3️⃣, or 4️⃣ if you want to track your turn order (optional)\n' +
++      `**Both players must confirm their participation:**\n` +
++      '• **FIRST**: Click 1️⃣ (went first) or 2️⃣ (went second) if you want to track turn order (optional)\n' +
+       '• **THEN**: React with 👍 to **confirm** your result\n' +
+       '• React with ❌ to **cancel** this game (creator only)\n\n' +
+       '**Turn order tracking is optional** - you can use `/setturnorder` later if you forget.\n\n' +
+-      '💡 **Tip**: You can assign turn order when submitting by adding numbers 1-4 before or after w/l/d.\n' +
+-      'Example: `/rank @player1 2 w @player2 1 l @player3 4 l @player4 3 l`\n\n' +
++      '💡 **Tip**: You can assign turn order when submitting by adding `1` or `2` before or after w/l/d.\n' +
++      'Example: `/rank @player1 1 w @player2 2 l`\n\n' +
+       `🎯 **Game ID: ${gameId}**${injectionNote}${additionalInfo}\n\n` +
+-      '⏰ Game expires in 1 hour if not all players confirm.'
++      '⏰ Game expires in 1 hour if both players don\'t confirm.'
+     )
+     .addFields(
+       players.map(p => {
+@@ -1919,7 +1826,7 @@
+           name: `${userNames[p.userId]}${commanderDisplay}${turnOrderDisplay}${p.team ? ` (${p.team})` : ''}`,
+           value:
+             `Result: ${p.status?.toUpperCase() ?? '❓'}\n` +
+-            (p.commander ? `Commander: ${p.commander}\n` : '') +
++            (p.commander ? `Deck/Team: ${p.commander}\n` : '') +
+             (p.turnOrder ? `Turn Order: ${p.turnOrder}\n` : '') +
+             `Elo: ${calculateElo(r.mu, r.sigma)}\n` +
+             `Mu: ${r.mu.toFixed(2)}\n` +
+@@ -1953,7 +1860,7 @@
+   // Add turn order reactions only for positions not already specified
+   const providedTurnOrders = new Set(players.filter(p => p.turnOrder).map(p => p.turnOrder!));
+   const missingTurnOrders = [1, 2, 3, 4].filter(t => !providedTurnOrders.has(t));
+-  const turnOrderEmojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣'];
++  const turnOrderEmojis = ['1️⃣', '2️⃣'];
+   
+   // Only add turn order reactions if there are missing turn orders
+   if (missingTurnOrders.length > 0) {
+@@ -2067,7 +1974,7 @@
+   // Always remove unauthorized reactions immediately
+   const validUsers = new Set(players.map(p => p.userId));
+   validUsers.add(interaction.user.id);
+-  const validEmojis = ['👍', '❌', '1️⃣', '2️⃣', '3️⃣', '4️⃣'];
++  const validEmojis = ['👍', '❌', '1️⃣', '2️⃣'];
+   
+   if (!validUsers.has(user.id) || !validEmojis.includes(reaction.emoji.name!)) {
+     try {
+@@ -2172,7 +2079,7 @@
+   }
+ 
+   // Handle turn order reactions - first come first served, users can change their own
+-  const turnOrderEmojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣'];
++  const turnOrderEmojis = ['1️⃣', '2️⃣'];
+   if (turnOrderEmojis.includes(reaction.emoji.name!)) {
+     const isParticipant = players.some(p => p.userId === user.id);
+     const playerHasTurnOrder = players.find(p => p.userId === user.id)?.turnOrder !== undefined;
+@@ -2269,13 +2176,13 @@
+   input: string,
+   afterGameId: string | null
+ ): Promise<void> {
+-  // Parse input: commander-name followed by w/l/d
++  // Parse input: deck/team name followed by w/l/d (deck-vs-deck mode is also 1v1).
+   const tokens = input.trim().split(/\s+/);
+-  if (tokens.length < 2 || tokens.length % 2 !== 0) {
++  if (tokens.length !== 4) {
+     await interaction.editReply({
+-      content: '⚠️ Invalid format for deck-only mode. Use: `commander-name w/l/d commander-name w/l/d ...`\n' +
+-               'Example: `atraxa-praetors-voice l edgar-markov w kaalia-of-the-vast l edgar-markov w`\n' +
+-               'Note: Duplicate commanders are allowed.'
++      content: '⚠️ Invalid format for deck-only mode. Use: `deck-name w/l/d deck-name w/l/d`\n' +
++               'Example: `mewtwo-hyper-offense w all-psychic l`\n' +
++               'Note: deck-vs-deck mode is 1v1 (exactly two entries).'
+     });
+     return;
+   }
+@@ -2301,42 +2208,29 @@
+     });
+   }
+ 
+-  // Validate deck count (3-4 players for cEDH)
+-  if (![3, 4].includes(decks.length)) {
++  // Deck-only 1v1 — exactly 2 decks.
++  if (decks.length !== 2) {
+     await interaction.editReply({
+-      content: '⚠️ Only 3-deck or 4-deck games are supported in cEDH mode.'
++      content: '⚠️ PokemonSkill only supports 1v1 (2-deck) games.'
+     });
+     return;
+   }
+ 
+   const winCount = decks.filter(d => d.status === 'w').length;
+-const drawCount = decks.filter(d => d.status === 'd').length; 
+-const lossCount = decks.filter(d => d.status === 'l').length;
++  const drawCount = decks.filter(d => d.status === 'd').length;
++  const lossCount = decks.filter(d => d.status === 'l').length;
+ 
+-// Enforce cEDH rules: ONLY 1 winner + remaining losers OR all draws
+-if (decks.length === 4) {
+-  if (winCount === 1 && lossCount === 3 && drawCount === 0) {
+-    // Valid: 1 winner, 3 losers
+-  } else if (winCount === 0 && lossCount === 0 && drawCount === 4) {
+-    // Valid: 4-way draw
++  // Three legal outcomes: deck1 wins / deck2 wins / draw.
++  if (winCount === 1 && lossCount === 1 && drawCount === 0) {
++    // Valid: one winner, one loser
++  } else if (winCount === 0 && lossCount === 0 && drawCount === 2) {
++    // Valid: draw
+   } else {
+     await interaction.editReply({
+-      content: '⚠️ Invalid result combination for cEDH format. Must be either: 1 winner + 3 losers, or 4 draws.'
++      content: '⚠️ Invalid result combination for 1v1 deck format. Must be either: 1 winner + 1 loser, or 2 draws.'
+     });
+     return;
+   }
+-} else if (decks.length === 3) {
+-  if (winCount === 1 && lossCount === 2 && drawCount === 0) {
+-    // Valid: 1 winner, 2 losers
+-  } else if (winCount === 0 && lossCount === 0 && drawCount === 3) {
+-    // Valid: 3-way draw
+-  } else {
+-    await interaction.editReply({
+-      content: '⚠️ Invalid result combination for 3-deck cEDH format. Must be either: 1 winner + 2 losers, or 3 draws.'
+-    });
+-    return;
+-  }
+-}
+ 
+   // Generate unique game ID
+   const gameId = await generateUniqueGameId();
+@@ -2366,10 +2260,9 @@
+   // Store game in master table (with backdated timestamp if injecting)
+   await storeGameInMaster(gameId, gameSequence, interaction.user.id, 'deck', submittedByAdmin, deckInjectedTimestamp || undefined);
+ 
+-  // Get unique commanders for validation (avoid validating duplicates multiple times)
++  // Free-form deck/team name validation (no external lookup).
+   const uniqueCommanders = [...new Set(decks.map(d => d.normalizedName))];
+-  
+-  // Validate all unique commanders exist on EDHREC
++
+   const validationResults = await Promise.all(
+     uniqueCommanders.map(async (normalizedName) => ({
+       normalizedName,
+@@ -2379,13 +2272,13 @@
+ 
+   const invalidDecks = validationResults.filter(r => !r.valid);
+   if (invalidDecks.length > 0) {
+-    const invalidNames = invalidDecks.map(r => 
++    const invalidNames = invalidDecks.map(r =>
+       decks.find(d => d.normalizedName === r.normalizedName)?.commander
+     ).filter(Boolean).join(', ');
+-    
++
+     await interaction.editReply({
+-      content: `⚠️ The following commanders could not be found on EDHREC: ${invalidNames}\n` +
+-               'Please check the spelling and use the format from EDHREC URLs (e.g., "atraxa-praetors-voice").'
++      content: `⚠️ Invalid deck/team name format: ${invalidNames}\n` +
++               'Names must be 2–100 characters using letters, digits, spaces, hyphens, apostrophes, commas, or periods.'
+     });
+     return;
+   }
+diff -u a/src/commands/set.ts b/src/commands/set.ts
+--- a/src/commands/set.ts	2026-05-04 00:30:55.210471211 +0000
++++ b/src/commands/set.ts	2026-05-04 03:45:20.164404285 +0000
+@@ -225,23 +225,6 @@
+       ? (opts: any) => interaction.editReply(opts)
+       : (opts: any) => interaction.reply(opts);
+ 
+-    // FIXED: Check for specific EDHREC validation errors and provide helpful feedback
+-    if (error instanceof Error && error.message.includes('not a valid commander name according to EDHREC')) {
+-      await respond({
+-        content: `⚠️ ${error.message}\nPlease check the spelling and use the format from EDHREC URLs (e.g., "atraxa-praetors-voice").`,
+-        ephemeral: true
+-      });
+-      return;
+-    }
+-
+-    if (error instanceof Error && error.message.includes('Unable to validate commander')) {
+-      await respond({
+-        content: `⚠️ ${error.message}\nThe EDHREC validation service may be temporarily unavailable. Please try again later.`,
+-        ephemeral: true
+-      });
+-      return;
+-    }
+-
+     // Generic error fallback
+     await respond({
+       content: 'An error occurred while updating settings.',
+@@ -861,9 +844,9 @@
+     }
+   }
+ 
+-  // Validate player count
+-  if (finalResults.length !== 4) {
+-    throw new Error(`Invalid player count: ${finalResults.length}. Player games require exactly 4 players.`);
++  // Validate player count (1v1)
++  if (finalResults.length !== 2) {
++    throw new Error(`Invalid player count: ${finalResults.length}. PokemonSkill is 1v1 — exactly 2 players.`);
+   }
+ 
+   // Validate result combination (same rules as /rank)
+@@ -871,10 +854,10 @@
+   const lossCount = finalResults.filter(r => r === 'l').length;
+   const drawCount = finalResults.filter(r => r === 'd').length;
+ 
+-  const isValid = (winCount === 1 && lossCount === 3 && drawCount === 0) ||
+-                  (winCount === 0 && lossCount === 0 && drawCount === 4);
++  const isValid = (winCount === 1 && lossCount === 1 && drawCount === 0) ||
++                  (winCount === 0 && lossCount === 0 && drawCount === 2);
+   if (!isValid) {
+-    throw new Error(`Invalid result combination: ${winCount}w/${lossCount}l/${drawCount}d. Must be either: 1 winner + 3 losers, or 4 draws.`);
++    throw new Error(`Invalid result combination: ${winCount}w/${lossCount}l/${drawCount}d. Must be either: 1 winner + 1 loser, or 2 draws.`);
+   }
+ 
+   // Determine added and removed players
+@@ -1479,20 +1462,7 @@
+ ) {
+   await interaction.deferReply();
+ 
+-  // Validate commander
+-  try {
+-    if (!await validateCommander(commanderName)) {
+-      await interaction.editReply({
+-        content: `"${commanderName}" is not a valid commander name according to EDHREC.`,
+-      });
+-      return;
+-    }
+-  } catch (error) {
+-    await interaction.editReply({
+-      content: `Unable to validate commander "${commanderName}".`,
+-    });
+-    return;
+-  }
++  // Free-form deck/team names — no external validation needed.
+ 
+   // Parse W/L/D if provided
+   let wldRecord = null;
+@@ -1514,7 +1484,7 @@
+   const result = await handleDeckRatingChanges(commanderName, mu, sigma, elo, wldRecord, adminId);
+ 
+   const embed = new EmbedBuilder()
+-    .setTitle('Commander Rating Updated')
++    .setTitle('Deck/Team Rating Updated')
+     .setDescription(result)
+     .setColor(0x00AE86)
+     .setTimestamp();
+@@ -1733,19 +1703,7 @@
+   // Ensure player record exists before updating defaultDeck
+   await getOrCreatePlayer(targetUserId);
+ 
+-  // VALIDATION: Check EDHREC for non-removal deck assignments
+-  if (deckName !== 'nocommander') {
+-    try {
+-      if (!await validateCommander(deckName)) {
+-        throw new Error(`"${deckName}" is not a valid commander name according to EDHREC.`);
+-      }
+-    } catch (error) {
+-      if (error instanceof Error && error.message.includes('not a valid commander name')) {
+-        throw error; // Re-throw our custom validation error
+-      }
+-      throw new Error(`Unable to validate commander "${deckName}" against EDHREC database.`);
+-    }
+-  }
++  // Free-form deck/team names — no external validation.
+ 
+   // Capture before state for snapshot
+   const player = await db.get('SELECT defaultDeck FROM players WHERE userId = ?', targetUserId);
