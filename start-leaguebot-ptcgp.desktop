@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=PokemonSkill (TCG Pocket)
+Comment=Start the PokemonSkill bot for the Pokémon TCG Pocket server
+Type=Application
+Terminal=true
+Exec=bash -c 'cd /home/gyarados/Programming/Games/Discord/PokemonSkill-PTCGP && ./start-leaguebot.sh --keep-open'
+Icon=utilities-terminal
+Categories=Game;
