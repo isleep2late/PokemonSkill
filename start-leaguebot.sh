@@ -50,9 +50,15 @@ for arg in "$@"; do
 done
 
 if [ ! -d "node_modules" ]; then
-  echo "node_modules not found. Run 'npm install' first."
-  pause_if_needed
-  exit 1
+  echo "=== node_modules not found. Running 'npm install'... ==="
+  npm install
+  if [ $? -ne 0 ]; then
+    echo "npm install failed! Check your internet connection and Node.js installation."
+    pause_if_needed
+    exit 1
+  fi
+  echo "=== npm install complete ==="
+  echo ""
 fi
 
 if [ ! -f ".env" ]; then
