@@ -1844,6 +1844,21 @@ for (const [userId, turnOrder] of adminCleanTurnOrderState.entries()) {
     embeds: [nonAdminEmbed]
   });
 
+  // Ghost-ping pattern: Discord fires push notifications on message creation,
+  // not on edits. The editReply above shows the mentions but doesn't notify the
+  // pinged players. Send a throwaway followUp containing only the mentions
+  // (with allowedMentions set to authorize the ping), then delete it. The
+  // notification fires; the channel stays clean.
+  try {
+    const ghostPing = await interaction.followUp({
+      content: pinged,
+      allowedMentions: { users: players.map(p => p.userId) }
+    });
+    await ghostPing.delete().catch(() => {});
+  } catch (pingError) {
+    logger.warn('[RANK] Failed to ghost-ping players:', pingError);
+  }
+
   const matchId = crypto.randomUUID();
     // Non-admin: wait for confirmations with enhanced reaction system
     const pending = new Set(players.map(p => p.userId));
