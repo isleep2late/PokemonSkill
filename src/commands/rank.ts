@@ -22,6 +22,14 @@ import { calculateElo, muFromElo } from '../utils/elo-utils.js';
 // Participation bonus: +1 Elo for playing a ranked game (max 5 per day)
 const PARTICIPATION_BONUS_ELO = 1;
 const MAX_DAILY_PARTICIPATION_BONUS = 5;
+
+// OpenSkill skill volatility for 1v1 Pokémon games. The default (mu/6 ≈ 4.17)
+// produces ~+86/-46 Elo swings for brand-new players, which felt too volatile.
+// Raising beta to 20 makes each result update mu by ~1.1 instead of ~2.6,
+// which combined with the elo-utils coefficient of 8 yields about +10 / -9 Elo
+// for a first game between two default-rated players. Subsequent games shrink
+// naturally as sigma drops with more data (e.g., +7/-6 by game 8).
+const OPENSKILL_BETA = 20;
 import { generateUniqueGameId, recordGameId } from '../utils/game-id-utils.js';
 import { config } from '../config.js';
 import crypto from 'crypto';
@@ -537,7 +545,7 @@ export async function replayPlayerGame(gameId: string): Promise<void> {
   const ranks = matches.map(match => statusRank[match.status] || 3);
 
   // Apply OpenSkill rating update
-  const newRatings = rate(gameRatings, { rank: ranks });
+  const newRatings = rate(gameRatings, { rank: ranks, beta: OPENSKILL_BETA });
 
   // Apply 3-player penalty if applicable
   const penalty = matches.length === 3 ? 0.9 : 1.0;
@@ -690,7 +698,7 @@ export async function replayDeckGame(gameId: string): Promise<void> {
   const ranks = matches.map(match => statusRank[match.status] || 3);
 
   // Apply OpenSkill rating update
-  const newRatings = rate(gameRatings, { rank: ranks });
+  const newRatings = rate(gameRatings, { rank: ranks, beta: OPENSKILL_BETA });
 
   // Apply 3-deck penalty if applicable
   const penalty = matches.length === 3 ? 0.9 : 1.0;
@@ -2570,7 +2578,7 @@ async function processGameResults(
   }
 
   const ordered = players.map(p => [preRatings[p.userId]]);
-  let newMatrix = rate(ordered, { rank: ranks });
+  let newMatrix = rate(ordered, { rank: ranks, beta: OPENSKILL_BETA });
   
   // Apply 3-player penalty if in cEDH mode
   if (isCEDHMode && numPlayers === 3) {
@@ -2903,7 +2911,7 @@ export async function processCommanderRatingsEnhanced(
   const ranks = commanderEntries.map(entry => statusRank[entry.status]);
 
   const ordered = entryRatings.map(r => [r]);
-  const newMatrix = rate(ordered, { rank: ranks });
+  const newMatrix = rate(ordered, { rank: ranks, beta: OPENSKILL_BETA });
 
   // Apply 3-deck penalty if needed (based on real commanders only)
   const realCommanderCount = commanderEntries.filter(c => !c.isPhantom).length;
@@ -3073,7 +3081,7 @@ async function processDeckResults(
     const r = deckRatings[deck.normalizedName];
     return [rating({ mu: r.mu, sigma: r.sigma })]; // Fresh copy per instance
   });
-  const newMatrix = rate(ordered, { rank: ranks });
+  const newMatrix = rate(ordered, { rank: ranks, beta: OPENSKILL_BETA });
 
   // Apply 3-deck penalty if needed
   const is3DeckGame = decks.length === 3;
