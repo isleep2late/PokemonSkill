@@ -79,6 +79,36 @@ class DiscordRateLimiter {
 
 const rateLimiter = new DiscordRateLimiter();
 
+// Tracks whether we've already warned the operator that the bot is missing
+// "Manage Messages" — without that permission Discord forbids the bot from
+// removing other users' reactions, so we get DiscordAPIError 50013 every
+// time we try to clean up an unauthorized or stale reaction. The README
+// documents this permission as optional, so spamming ERROR logs for it
+// just clutters bot.log. We log it once at INFO and stay quiet thereafter.
+let missingManageMessagesWarned = false;
+
+/**
+ * Log a reaction-removal failure. Silences the expected "Missing Permissions"
+ * error (Discord code 50013) since the README calls that permission optional,
+ * but still surfaces other unexpected errors at ERROR level.
+ */
+function logReactionRemovalError(context: string, error: unknown): void {
+  const code = (error as { code?: number })?.code;
+  if (code === 50013) {
+    if (!missingManageMessagesWarned) {
+      logger.info(
+        '[REACTIONS] Bot lacks the "Manage Messages" permission, so it cannot ' +
+        'clean up unauthorized or stale reactions. Players may need to remove ' +
+        'their own reactions manually. This is documented as optional in the README; ' +
+        'further occurrences will be suppressed.'
+      );
+      missingManageMessagesWarned = true;
+    }
+    return;
+  }
+  logger.error(`${context}:`, error);
+}
+
 // Input validation utilities
 class InputValidator {
   static validateUserId(userId: string): boolean {
@@ -1695,7 +1725,7 @@ turnOrderCollector.on('collect', async (reaction, user) => {
     try {
       await reaction.users.remove(user.id);
     } catch (error) {
-      logger.error('Failed to remove unauthorized admin reaction:', error);
+      logReactionRemovalError('Failed to remove unauthorized admin reaction', error);
     }
     return; // Exit immediately
   }
@@ -1705,7 +1735,7 @@ turnOrderCollector.on('collect', async (reaction, user) => {
     try {
       await reaction.users.remove(user.id);
     } catch (error) {
-      logger.error('Failed to remove reaction from player with existing turn order:', error);
+      logReactionRemovalError('Failed to remove reaction from player with existing turn order', error);
     }
     return;
   }
@@ -1717,7 +1747,7 @@ turnOrderCollector.on('collect', async (reaction, user) => {
     try {
       await reaction.users.remove(user.id);
     } catch (error) {
-      logger.error('Failed to remove unavailable admin turn order reaction:', error);
+      logReactionRemovalError('Failed to remove unavailable admin turn order reaction', error);
     }
     return;
   }
@@ -1731,7 +1761,7 @@ turnOrderCollector.on('collect', async (reaction, user) => {
     try {
       await reaction.users.remove(user.id);
     } catch (error) {
-      logger.error('Failed to remove contested admin turn order reaction:', error);
+      logReactionRemovalError('Failed to remove contested admin turn order reaction', error);
     }
     return;
   }
@@ -1746,7 +1776,7 @@ turnOrderCollector.on('collect', async (reaction, user) => {
       const oldReaction = replyMsg.reactions.cache.find(r => r.emoji.name === oldEmoji);
       if (oldReaction) await oldReaction.users.remove(user.id);
     } catch (error) {
-      logger.error('Failed to remove old admin turn order reaction:', error);
+      logReactionRemovalError('Failed to remove old admin turn order reaction', error);
     }
   }
 
@@ -1997,7 +2027,7 @@ collector.on('collect', async (reaction, user) => {
     try {
       await reaction.users.remove(user.id);
     } catch (error) {
-      logger.error('Failed to remove unauthorized reaction:', error);
+      logReactionRemovalError('Failed to remove unauthorized reaction', error);
     }
     return; // Exit immediately - don't process anything
   }
@@ -2106,7 +2136,7 @@ collector.on('collect', async (reaction, user) => {
       try {
         await reaction.users.remove(user.id);
       } catch (error) {
-        logger.error('Failed to remove invalid turn order reaction:', error);
+        logReactionRemovalError('Failed to remove invalid turn order reaction', error);
       }
       return;
     }
@@ -2119,7 +2149,7 @@ collector.on('collect', async (reaction, user) => {
       try {
         await reaction.users.remove(user.id);
       } catch (error) {
-        logger.error('Failed to remove unavailable turn order reaction:', error);
+        logReactionRemovalError('Failed to remove unavailable turn order reaction', error);
       }
       return;
     }
@@ -2133,7 +2163,7 @@ collector.on('collect', async (reaction, user) => {
       try {
         await reaction.users.remove(user.id);
       } catch (error) {
-        logger.error('Failed to remove contested turn order reaction:', error);
+        logReactionRemovalError('Failed to remove contested turn order reaction', error);
       }
       return;
     }
@@ -2148,7 +2178,7 @@ collector.on('collect', async (reaction, user) => {
         const oldReaction = replyMsg.reactions.cache.find(r => r.emoji.name === oldEmoji);
         if (oldReaction) await oldReaction.users.remove(user.id);
       } catch (error) {
-        logger.error('Failed to remove old turn order reaction:', error);
+        logReactionRemovalError('Failed to remove old turn order reaction', error);
       }
     }
 
