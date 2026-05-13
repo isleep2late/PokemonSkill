@@ -22,6 +22,14 @@ import { calculateElo, muFromElo } from '../utils/elo-utils.js';
 // Participation bonus: +1 Elo for playing a ranked game (max 5 per day)
 const PARTICIPATION_BONUS_ELO = 1;
 const MAX_DAILY_PARTICIPATION_BONUS = 5;
+
+// OpenSkill skill volatility for 1v1 Pokémon games. The default (mu/6 ≈ 4.17)
+// produces ~+86/-46 Elo swings for brand-new players, which felt too volatile.
+// Raising beta to 20 makes each result update mu by ~1.1 instead of ~2.6,
+// which combined with the elo-utils coefficient of 8 yields about +10 / -9 Elo
+// for a first game between two default-rated players. Subsequent games shrink
+// naturally as sigma drops with more data (e.g., +7/-6 by game 8).
+const OPENSKILL_BETA = 20;
 import { generateUniqueGameId, recordGameId } from '../utils/game-id-utils.js';
 import { config } from '../config.js';
 import crypto from 'crypto';
@@ -78,6 +86,36 @@ class DiscordRateLimiter {
 }
 
 const rateLimiter = new DiscordRateLimiter();
+
+// Tracks whether we've already warned the operator that the bot is missing
+// "Manage Messages" — without that permission Discord forbids the bot from
+// removing other users' reactions, so we get DiscordAPIError 50013 every
+// time we try to clean up an unauthorized or stale reaction. The README
+// documents this permission as optional, so spamming ERROR logs for it
+// just clutters bot.log. We log it once at INFO and stay quiet thereafter.
+let missingManageMessagesWarned = false;
+
+/**
+ * Log a reaction-removal failure. Silences the expected "Missing Permissions"
+ * error (Discord code 50013) since the README calls that permission optional,
+ * but still surfaces other unexpected errors at ERROR level.
+ */
+function logReactionRemovalError(context: string, error: unknown): void {
+  const code = (error as { code?: number })?.code;
+  if (code === 50013) {
+    if (!missingManageMessagesWarned) {
+      logger.info(
+        '[REACTIONS] Bot lacks the "Manage Messages" permission, so it cannot ' +
+        'clean up unauthorized or stale reactions. Players may need to remove ' +
+        'their own reactions manually. This is documented as optional in the README; ' +
+        'further occurrences will be suppressed.'
+      );
+      missingManageMessagesWarned = true;
+    }
+    return;
+  }
+  logger.error(`${context}:`, error);
+}
 
 // Input validation utilities
 class InputValidator {
@@ -507,7 +545,7 @@ export async function replayPlayerGame(gameId: string): Promise<void> {
   const ranks = matches.map(match => statusRank[match.status] || 3);
 
   // Apply OpenSkill rating update
-  const newRatings = rate(gameRatings, { rank: ranks });
+  const newRatings = rate(gameRatings, { rank: ranks, beta: OPENSKILL_BETA });
 
   // Apply 3-player penalty if applicable
   const penalty = matches.length === 3 ? 0.9 : 1.0;
@@ -660,7 +698,7 @@ export async function replayDeckGame(gameId: string): Promise<void> {
   const ranks = matches.map(match => statusRank[match.status] || 3);
 
   // Apply OpenSkill rating update
-  const newRatings = rate(gameRatings, { rank: ranks });
+  const newRatings = rate(gameRatings, { rank: ranks, beta: OPENSKILL_BETA });
 
   // Apply 3-deck penalty if applicable
   const penalty = matches.length === 3 ? 0.9 : 1.0;
@@ -1592,7 +1630,7 @@ for (let i = 0; i < tokens.length; i++) {
 
   // Handle turn order collection
   const providedTurnOrders = new Set(players.filter(p => p.turnOrder).map(p => p.turnOrder!));
-  const missingTurnOrders = [1, 2, 3, 4].filter(t => !providedTurnOrders.has(t));
+  const missingTurnOrders = [1, 2].filter(t => !providedTurnOrders.has(t));
   const turnOrderEmojis = ['1️⃣', '2️⃣'];
   
   if (missingTurnOrders.length > 0) {
@@ -1622,15 +1660,16 @@ const adminCleanTurnOrderState = new Map<string, number>();
 const checkAndApplyAdminAutoAssignment = () => {
   const playersWithTurnOrder = players.filter(p => p.turnOrder !== undefined || adminCleanTurnOrderState.has(p.userId));
   const playersWithoutTurnOrder = players.filter(p => p.turnOrder === undefined && !adminCleanTurnOrderState.has(p.userId));
-  
-  // If exactly 3 players have turn orders and 1 doesn't, auto-assign
-  if (playersWithTurnOrder.length === 3 && playersWithoutTurnOrder.length === 1) {
+
+  // 1v1 process-of-elimination: if one player has set a turn order and the
+  // other hasn't, auto-assign the remaining slot to the second player.
+  if (playersWithTurnOrder.length === 1 && playersWithoutTurnOrder.length === 1) {
     const providedTurnOrders = new Set([
       ...players.filter(p => p.turnOrder !== undefined).map(p => p.turnOrder!),
       ...Array.from(adminCleanTurnOrderState.values())
     ]);
-    
-    const allTurnOrders = [1, 2, 3, 4];
+
+    const allTurnOrders = [1, 2];
     const missingTurnOrder = allTurnOrders.find(t => !providedTurnOrders.has(t));
     
     if (missingTurnOrder) {
@@ -1694,7 +1733,7 @@ turnOrderCollector.on('collect', async (reaction, user) => {
     try {
       await reaction.users.remove(user.id);
     } catch (error) {
-      logger.error('Failed to remove unauthorized admin reaction:', error);
+      logReactionRemovalError('Failed to remove unauthorized admin reaction', error);
     }
     return; // Exit immediately
   }
@@ -1704,7 +1743,7 @@ turnOrderCollector.on('collect', async (reaction, user) => {
     try {
       await reaction.users.remove(user.id);
     } catch (error) {
-      logger.error('Failed to remove reaction from player with existing turn order:', error);
+      logReactionRemovalError('Failed to remove reaction from player with existing turn order', error);
     }
     return;
   }
@@ -1716,7 +1755,7 @@ turnOrderCollector.on('collect', async (reaction, user) => {
     try {
       await reaction.users.remove(user.id);
     } catch (error) {
-      logger.error('Failed to remove unavailable admin turn order reaction:', error);
+      logReactionRemovalError('Failed to remove unavailable admin turn order reaction', error);
     }
     return;
   }
@@ -1730,7 +1769,7 @@ turnOrderCollector.on('collect', async (reaction, user) => {
     try {
       await reaction.users.remove(user.id);
     } catch (error) {
-      logger.error('Failed to remove contested admin turn order reaction:', error);
+      logReactionRemovalError('Failed to remove contested admin turn order reaction', error);
     }
     return;
   }
@@ -1745,7 +1784,7 @@ turnOrderCollector.on('collect', async (reaction, user) => {
       const oldReaction = replyMsg.reactions.cache.find(r => r.emoji.name === oldEmoji);
       if (oldReaction) await oldReaction.users.remove(user.id);
     } catch (error) {
-      logger.error('Failed to remove old admin turn order reaction:', error);
+      logReactionRemovalError('Failed to remove old admin turn order reaction', error);
     }
   }
 
@@ -1844,6 +1883,21 @@ for (const [userId, turnOrder] of adminCleanTurnOrderState.entries()) {
     embeds: [nonAdminEmbed]
   });
 
+  // Ghost-ping pattern: Discord fires push notifications on message creation,
+  // not on edits. The editReply above shows the mentions but doesn't notify the
+  // pinged players. Send a throwaway followUp containing only the mentions
+  // (with allowedMentions set to authorize the ping), then delete it. The
+  // notification fires; the channel stays clean.
+  try {
+    const ghostPing = await interaction.followUp({
+      content: pinged,
+      allowedMentions: { users: players.map(p => p.userId) }
+    });
+    await ghostPing.delete().catch(() => {});
+  } catch (pingError) {
+    logger.warn('[RANK] Failed to ghost-ping players:', pingError);
+  }
+
   const matchId = crypto.randomUUID();
     // Non-admin: wait for confirmations with enhanced reaction system
     const pending = new Set(players.map(p => p.userId));
@@ -1859,7 +1913,7 @@ for (const [userId, turnOrder] of adminCleanTurnOrderState.entries()) {
   
   // Add turn order reactions only for positions not already specified
   const providedTurnOrders = new Set(players.filter(p => p.turnOrder).map(p => p.turnOrder!));
-  const missingTurnOrders = [1, 2, 3, 4].filter(t => !providedTurnOrders.has(t));
+  const missingTurnOrders = [1, 2].filter(t => !providedTurnOrders.has(t));
   const turnOrderEmojis = ['1️⃣', '2️⃣'];
   
   // Only add turn order reactions if there are missing turn orders
@@ -1889,7 +1943,7 @@ for (const [userId, turnOrder] of adminCleanTurnOrderState.entries()) {
     const turnOrderSelections = new Map<string, number>();
 
  const providedTurnOrders = new Set(players.filter(p => p.turnOrder).map(p => p.turnOrder!));
-const missingTurnOrders = [1, 2, 3, 4].filter(t => !providedTurnOrders.has(t));
+const missingTurnOrders = [1, 2].filter(t => !providedTurnOrders.has(t));
 
 // Replace the non-admin collector with this approach that maintains its own state
 const collector = replyMsg.createReactionCollector({
@@ -1907,15 +1961,16 @@ const cleanTurnOrderState = new Map<string, number>();
 const checkAndApplyAutoAssignment = () => {
   const playersWithTurnOrder = players.filter(p => p.turnOrder !== undefined || cleanTurnOrderState.has(p.userId));
   const playersWithoutTurnOrder = players.filter(p => p.turnOrder === undefined && !cleanTurnOrderState.has(p.userId));
-  
-  // If exactly 3 players have turn orders and 1 doesn't, auto-assign
-  if (playersWithTurnOrder.length === 3 && playersWithoutTurnOrder.length === 1) {
+
+  // 1v1 process-of-elimination: if one player has set a turn order and the
+  // other hasn't, auto-assign the remaining slot to the second player.
+  if (playersWithTurnOrder.length === 1 && playersWithoutTurnOrder.length === 1) {
     const providedTurnOrders = new Set([
       ...players.filter(p => p.turnOrder !== undefined).map(p => p.turnOrder!),
       ...Array.from(cleanTurnOrderState.values())
     ]);
-    
-    const allTurnOrders = [1, 2, 3, 4];
+
+    const allTurnOrders = [1, 2];
     const missingTurnOrder = allTurnOrders.find(t => !providedTurnOrders.has(t));
     
     if (missingTurnOrder) {
@@ -1980,7 +2035,7 @@ collector.on('collect', async (reaction, user) => {
     try {
       await reaction.users.remove(user.id);
     } catch (error) {
-      logger.error('Failed to remove unauthorized reaction:', error);
+      logReactionRemovalError('Failed to remove unauthorized reaction', error);
     }
     return; // Exit immediately - don't process anything
   }
@@ -2043,15 +2098,16 @@ collector.on('collect', async (reaction, user) => {
           }
         }
 
-        // Auto-assign logic
+        // 1v1 process-of-elimination: if one player set a turn order and the
+        // other didn't, auto-fill the remaining slot before processing.
         const playersWithTurnOrder = players.filter(p => p.turnOrder !== undefined);
         const playersWithoutTurnOrder = players.filter(p => p.turnOrder === undefined);
-        
-        if (playersWithTurnOrder.length === 3 && playersWithoutTurnOrder.length === 1) {
+
+        if (playersWithTurnOrder.length === 1 && playersWithoutTurnOrder.length === 1) {
           const finalProvidedTurnOrders = new Set(playersWithTurnOrder.map(p => p.turnOrder!));
-          const allTurnOrders = [1, 2, 3, 4];
+          const allTurnOrders = [1, 2];
           const finalMissingTurnOrder = allTurnOrders.find(t => !finalProvidedTurnOrders.has(t));
-          
+
           if (finalMissingTurnOrder) {
             playersWithoutTurnOrder[0].turnOrder = finalMissingTurnOrder;
           }
@@ -2088,7 +2144,7 @@ collector.on('collect', async (reaction, user) => {
       try {
         await reaction.users.remove(user.id);
       } catch (error) {
-        logger.error('Failed to remove invalid turn order reaction:', error);
+        logReactionRemovalError('Failed to remove invalid turn order reaction', error);
       }
       return;
     }
@@ -2101,7 +2157,7 @@ collector.on('collect', async (reaction, user) => {
       try {
         await reaction.users.remove(user.id);
       } catch (error) {
-        logger.error('Failed to remove unavailable turn order reaction:', error);
+        logReactionRemovalError('Failed to remove unavailable turn order reaction', error);
       }
       return;
     }
@@ -2115,7 +2171,7 @@ collector.on('collect', async (reaction, user) => {
       try {
         await reaction.users.remove(user.id);
       } catch (error) {
-        logger.error('Failed to remove contested turn order reaction:', error);
+        logReactionRemovalError('Failed to remove contested turn order reaction', error);
       }
       return;
     }
@@ -2130,7 +2186,7 @@ collector.on('collect', async (reaction, user) => {
         const oldReaction = replyMsg.reactions.cache.find(r => r.emoji.name === oldEmoji);
         if (oldReaction) await oldReaction.users.remove(user.id);
       } catch (error) {
-        logger.error('Failed to remove old turn order reaction:', error);
+        logReactionRemovalError('Failed to remove old turn order reaction', error);
       }
     }
 
@@ -2522,7 +2578,7 @@ async function processGameResults(
   }
 
   const ordered = players.map(p => [preRatings[p.userId]]);
-  let newMatrix = rate(ordered, { rank: ranks });
+  let newMatrix = rate(ordered, { rank: ranks, beta: OPENSKILL_BETA });
   
   // Apply 3-player penalty if in cEDH mode
   if (isCEDHMode && numPlayers === 3) {
@@ -2855,7 +2911,7 @@ export async function processCommanderRatingsEnhanced(
   const ranks = commanderEntries.map(entry => statusRank[entry.status]);
 
   const ordered = entryRatings.map(r => [r]);
-  const newMatrix = rate(ordered, { rank: ranks });
+  const newMatrix = rate(ordered, { rank: ranks, beta: OPENSKILL_BETA });
 
   // Apply 3-deck penalty if needed (based on real commanders only)
   const realCommanderCount = commanderEntries.filter(c => !c.isPhantom).length;
@@ -3025,7 +3081,7 @@ async function processDeckResults(
     const r = deckRatings[deck.normalizedName];
     return [rating({ mu: r.mu, sigma: r.sigma })]; // Fresh copy per instance
   });
-  const newMatrix = rate(ordered, { rank: ranks });
+  const newMatrix = rate(ordered, { rank: ranks, beta: OPENSKILL_BETA });
 
   // Apply 3-deck penalty if needed
   const is3DeckGame = decks.length === 3;

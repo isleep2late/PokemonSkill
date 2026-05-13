@@ -15,12 +15,12 @@ PokemonSkill is a fork of [cEDHSkill](https://github.com/isleep2late/cEDHSkill) 
 | Phantom opponents | 3 phantoms | 1 phantom |
 | Target games | cEDH Magic | Pokémon TCG Pocket, Pokémon Showdown |
 
-Everything else — OpenSkill rating math, sigma-based rating decay, undo/redo, snapshots, audit logs, the suspicion checker, the `/timewalk` admin tool, season reset (`/thanossnap`), participation bonuses, and the Elo formula `Elo = 1000 + 25 * (mu - 3 * sigma)` — is preserved.
+Everything else — sigma-based rating decay, undo/redo, snapshots, audit logs, the suspicion checker, the `/timewalk` admin tool, season reset (`/thanossnap`), and participation bonuses — is preserved. The Elo display formula is retuned for 1v1 (coefficient 8 instead of 25, plus OpenSkill `beta = 20`) so a first match between two default-rated players swings roughly **+10 / −9 Elo** instead of cEDH's ±50–80.
 
 ## Features
 
 - **Dual Rating Systems** — Separate rankings for **players** and **decks/teams**
-- **OpenSkill-Based Elo** — `Elo = 1000 + 25 * (mu - 3 * sigma)`
+- **OpenSkill-Based Elo** — `Elo = 1000 + 8 * (mu - 3 * sigma)` — first game ≈ ±10 Elo, shrinking naturally as players accumulate data (`±7` by game 8, smaller still after that)
 - **Free-Form Deck/Team Names** — register *any* name (TCG Pocket decks like "All Psychic" or Showdown teams like "Mewtwo Hyper Offense")
 - **1v1 Format** — exactly 2 players per match; outcomes are P1 wins / P2 wins / draw
 - **Turn Order Tracking** — optional `1` (went first) vs `2` (went second) per game; per-player and per-deck turn-order win-rates
@@ -125,10 +125,21 @@ Any other combination (`2w`, `2l`, `1w + 1d`, etc.) is rejected.
 PokemonSkill uses [OpenSkill](https://github.com/philihp/openskill.js)'s Plackett-Luce model. Each player has a Bayesian skill estimate `mu` and an uncertainty `sigma`. The displayed Elo is
 
 ```
-Elo = 1000 + 25 * (mu - 3 * sigma)
+Elo = 1000 + 8 * (mu - 3 * sigma)
 ```
 
-After each match, OpenSkill updates both players' `mu`/`sigma` based on the outcome. A 1v1 match is fed in as two teams of one player each, with ranks `[1, 2]` for a decisive game or `[1, 1]` for a draw.
+After each match, OpenSkill updates both players' `mu`/`sigma` based on the outcome. A 1v1 match is fed in as two teams of one player each, with ranks `[1, 2]` for a decisive game or `[1, 1]` for a draw. The bot passes `beta: 20` to OpenSkill (higher than the default `mu/6 ≈ 4.17`) which makes each game shift `mu` by ~1 instead of ~2.7, giving tighter, less volatile rating swings.
+
+**Per-game movement** (between two default-rated players starting at mu=25, sigma=8.333):
+
+| Game | Winner Δ | Loser Δ |
+| --- | --- | --- |
+| 1 | +10 | −9 |
+| 2 | +9 | −8 |
+| 5 | +8 | −7 |
+| 8 | +7 | −6 |
+
+Gains shrink naturally as `sigma` drops — the more data the model has on a player, the smaller each subsequent result moves them. Coefficient `8` and `beta = 20` were chosen specifically to hit the "~±10 Elo per game initially, ±1 variance" target for 1v1 matches; cEDH's coefficient of 25 with default `beta` produces ~±60 swings in 1v1, which is too volatile for a 2-player ladder.
 
 **Decay** is sigma-based: after 6 days of inactivity (configurable via `DECAY_START_DAYS`), a player loses 1 Elo per day **by increasing sigma**, not by lowering mu. This means inactivity decreases confidence in the rating rather than damaging the skill estimate, so returning players reconverge quickly. Decay floors at 1050 Elo.
 

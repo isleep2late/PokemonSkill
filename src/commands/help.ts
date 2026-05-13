@@ -40,7 +40,7 @@ export async function execute(interaction: ChatInputCommandInteraction) {
         .setDescription('**PokemonSkill** is an OpenSkill-based 1v1 rating system for Pokémon TCG Pocket and Pokémon Showdown.')
         .addFields(
           { name: 'Mu & Sigma', value: 'Mu represents skill. Sigma is confidence in the rating.' },
-          { name: 'Elo Conversion', value: '`Elo = 1000 + 25 * (mu - 3 * sigma)`' },
+          { name: 'Elo Conversion', value: '`Elo = 1000 + 8 * (mu - 3 * sigma)` — ~±10 Elo per game initially' },
           { name: 'Turn Order Tracking', value: 'Optional — track who went first vs. second (1 = first, 2 = second).' },
           { name: 'Dual Systems', value: 'Separate ranking systems for players and registered decks/teams (e.g. "Mewtwo Hyper Offense", "All Psychic").' },
           { name: 'Qualification', value: 'Minimum 5 games required to appear in official rankings.' },
