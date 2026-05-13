@@ -1592,7 +1592,7 @@ for (let i = 0; i < tokens.length; i++) {
 
   // Handle turn order collection
   const providedTurnOrders = new Set(players.filter(p => p.turnOrder).map(p => p.turnOrder!));
-  const missingTurnOrders = [1, 2, 3, 4].filter(t => !providedTurnOrders.has(t));
+  const missingTurnOrders = [1, 2].filter(t => !providedTurnOrders.has(t));
   const turnOrderEmojis = ['1️⃣', '2️⃣'];
   
   if (missingTurnOrders.length > 0) {
@@ -1622,15 +1622,16 @@ const adminCleanTurnOrderState = new Map<string, number>();
 const checkAndApplyAdminAutoAssignment = () => {
   const playersWithTurnOrder = players.filter(p => p.turnOrder !== undefined || adminCleanTurnOrderState.has(p.userId));
   const playersWithoutTurnOrder = players.filter(p => p.turnOrder === undefined && !adminCleanTurnOrderState.has(p.userId));
-  
-  // If exactly 3 players have turn orders and 1 doesn't, auto-assign
-  if (playersWithTurnOrder.length === 3 && playersWithoutTurnOrder.length === 1) {
+
+  // 1v1 process-of-elimination: if one player has set a turn order and the
+  // other hasn't, auto-assign the remaining slot to the second player.
+  if (playersWithTurnOrder.length === 1 && playersWithoutTurnOrder.length === 1) {
     const providedTurnOrders = new Set([
       ...players.filter(p => p.turnOrder !== undefined).map(p => p.turnOrder!),
       ...Array.from(adminCleanTurnOrderState.values())
     ]);
-    
-    const allTurnOrders = [1, 2, 3, 4];
+
+    const allTurnOrders = [1, 2];
     const missingTurnOrder = allTurnOrders.find(t => !providedTurnOrders.has(t));
     
     if (missingTurnOrder) {
@@ -1874,7 +1875,7 @@ for (const [userId, turnOrder] of adminCleanTurnOrderState.entries()) {
   
   // Add turn order reactions only for positions not already specified
   const providedTurnOrders = new Set(players.filter(p => p.turnOrder).map(p => p.turnOrder!));
-  const missingTurnOrders = [1, 2, 3, 4].filter(t => !providedTurnOrders.has(t));
+  const missingTurnOrders = [1, 2].filter(t => !providedTurnOrders.has(t));
   const turnOrderEmojis = ['1️⃣', '2️⃣'];
   
   // Only add turn order reactions if there are missing turn orders
@@ -1904,7 +1905,7 @@ for (const [userId, turnOrder] of adminCleanTurnOrderState.entries()) {
     const turnOrderSelections = new Map<string, number>();
 
  const providedTurnOrders = new Set(players.filter(p => p.turnOrder).map(p => p.turnOrder!));
-const missingTurnOrders = [1, 2, 3, 4].filter(t => !providedTurnOrders.has(t));
+const missingTurnOrders = [1, 2].filter(t => !providedTurnOrders.has(t));
 
 // Replace the non-admin collector with this approach that maintains its own state
 const collector = replyMsg.createReactionCollector({
@@ -1922,15 +1923,16 @@ const cleanTurnOrderState = new Map<string, number>();
 const checkAndApplyAutoAssignment = () => {
   const playersWithTurnOrder = players.filter(p => p.turnOrder !== undefined || cleanTurnOrderState.has(p.userId));
   const playersWithoutTurnOrder = players.filter(p => p.turnOrder === undefined && !cleanTurnOrderState.has(p.userId));
-  
-  // If exactly 3 players have turn orders and 1 doesn't, auto-assign
-  if (playersWithTurnOrder.length === 3 && playersWithoutTurnOrder.length === 1) {
+
+  // 1v1 process-of-elimination: if one player has set a turn order and the
+  // other hasn't, auto-assign the remaining slot to the second player.
+  if (playersWithTurnOrder.length === 1 && playersWithoutTurnOrder.length === 1) {
     const providedTurnOrders = new Set([
       ...players.filter(p => p.turnOrder !== undefined).map(p => p.turnOrder!),
       ...Array.from(cleanTurnOrderState.values())
     ]);
-    
-    const allTurnOrders = [1, 2, 3, 4];
+
+    const allTurnOrders = [1, 2];
     const missingTurnOrder = allTurnOrders.find(t => !providedTurnOrders.has(t));
     
     if (missingTurnOrder) {
@@ -2058,15 +2060,16 @@ collector.on('collect', async (reaction, user) => {
           }
         }
 
-        // Auto-assign logic
+        // 1v1 process-of-elimination: if one player set a turn order and the
+        // other didn't, auto-fill the remaining slot before processing.
         const playersWithTurnOrder = players.filter(p => p.turnOrder !== undefined);
         const playersWithoutTurnOrder = players.filter(p => p.turnOrder === undefined);
-        
-        if (playersWithTurnOrder.length === 3 && playersWithoutTurnOrder.length === 1) {
+
+        if (playersWithTurnOrder.length === 1 && playersWithoutTurnOrder.length === 1) {
           const finalProvidedTurnOrders = new Set(playersWithTurnOrder.map(p => p.turnOrder!));
-          const allTurnOrders = [1, 2, 3, 4];
+          const allTurnOrders = [1, 2];
           const finalMissingTurnOrder = allTurnOrders.find(t => !finalProvidedTurnOrders.has(t));
-          
+
           if (finalMissingTurnOrder) {
             playersWithoutTurnOrder[0].turnOrder = finalMissingTurnOrder;
           }
