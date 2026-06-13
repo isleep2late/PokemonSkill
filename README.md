@@ -1,8 +1,18 @@
-# PokemonSkill v0.01 Beta
+# PokemonSkill v0.02 Beta
 
 A Discord bot for ranking 1v1 Pokémon battles — both **Pokémon TCG Pocket** and **Pokémon Showdown** — using [OpenSkill](https://github.com/philihp/openskill.js) (Weng-Lin Bayesian Rating).
 
 PokemonSkill is a fork of [cEDHSkill](https://github.com/isleep2late/cEDHSkill) adapted from a 4-player free-for-all rating system to a 1v1 ladder. Decks and teams are registered as **free-form names** — there's no external database lookup, so anything works ("Mewtwo Hyper Offense", "All Psychic", "Charizard ex Pocket", "Misty Starmie").
+
+## What's New in v0.02 Beta
+
+A stability & reliability release for game confirmations — no rating math changed.
+
+- **More reliable 👍 confirmations** — the reaction collector now uses message/reaction *partials*, so a player's 👍 still registers even if the confirmation message gets evicted from Discord's cache during its confirmation window.
+- **Ghost-game prevention** — a game is now stored as `pending` and only promoted to `confirmed` (and counted toward ratings/leaderboards) *after* its match rows are written. A restart or crash while a game is awaiting confirmation can no longer leave a phantom "confirmed" game with no results. On startup the bot also archives any pre-existing ghosts to a `ghost_games_archive` table (recoverable, never silently deleted).
+- **Crash-safe shutdown** — on `SIGINT`/`SIGTERM` the bot checkpoints the SQLite WAL (`TRUNCATE`) and closes the database cleanly, so a stop or crash can no longer strand recent writes in an un-checkpointed WAL.
+- **Clearer admin auto-confirm message** — figures in the auto-confirm embed are now explicitly labelled as each player's rating *before* the game, pointing to the "Results are now final!" message for the before → after change.
+- **Leaner gateway intents** — dropped the unused `GuildMessages`/`MessageContent` intents (the bot's only message handler acts on DMs, which don't need them) to cut gateway event load.
 
 ## What's different from cEDHSkill
 

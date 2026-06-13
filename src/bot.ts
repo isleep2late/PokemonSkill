@@ -32,12 +32,22 @@ export interface ExtendedClient extends Client {
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
+    // GuildMessages/MessageContent stay OUT on purpose: the messageCreate
+    // handler only acts on DMs (it returns immediately for guild messages),
+    // and DM content is delivered without those privileged intents. They were
+    // the real gateway-event flood source in large servers, so the bot omits
+    // them.
+    // REQUIRED for game confirmations. Game results are confirmed via
+    // replyMsg.createReactionCollector(...) in commands/rank.ts; reaction
+    // collectors only receive events when this intent is enabled. Do NOT
+    // remove it (doing so silently breaks all player 👍 confirmations while
+    // admin auto-submit keeps working, because that's an interaction).
     GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.DirectMessages,
   ],
-  partials: [Partials.Channel],
+  // Message/Reaction partials let the collector still receive reactions if the
+  // confirmation message is evicted from cache during its confirmation window.
+  partials: [Partials.Channel, Partials.Message, Partials.Reaction],
 }) as ExtendedClient;
 
 client.commands = new Collection();
@@ -533,6 +543,15 @@ async function main() {
   client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     if (!interaction.isChatInputCommand()) return;
 
+    // SHARED-TOKEN SAFETY: this bot account runs as several concurrent processes
+    // (cEDH + the two Pokémon servers), one per server. Discord delivers EVERY
+    // interaction to ALL of them, so each process must ignore interactions from
+    // any guild other than its own — otherwise multiple bots race to acknowledge
+    // the same command (10062 / 40060 "already acknowledged") and the wrong bot
+    // can answer it against the wrong database. config.guildId is this process's
+    // server; bail on anything else (including a null guildId from a DM).
+    if (interaction.guildId !== config.guildId) return;
+
     const command = client.commands.get(interaction.commandName);
     if (!command) {
       logger.error(`No command matching ${interaction.commandName} found`);
@@ -590,18 +609,23 @@ async function main() {
 
       logger.info(`[DM] From ${message.author.username} (${message.author.id}): "${content}" | admin: ${isAdmin} | mod: ${isMod}`);
 
-      if (!hasAccess) {
-        await message.reply("Only registered admins and moderators can use this command.");
-        return;
-      }
+      // SHARED-TOKEN SAFETY: DMs carry no guild, so every bot process on this
+      // account receives them. Silently ignore DMs from anyone who isn't an
+      // admin/mod of THIS bot's server, so a stranger isn't answered once per
+      // running bot. (Someone who administers more than one of these servers
+      // gets one reply per server — each server's alert setting is separate, so
+      // the reply is labelled with the server name below.)
+      if (!hasAccess) return;
+
+      const serverLabel = client.guilds.cache.get(config.guildId)?.name ?? 'this server';
 
       if (content === '!optout') {
         await setAlertOptIn(message.author.id, false);
-        await message.reply("✅ You will no longer receive suspicious activity alerts.");
+        await message.reply(`✅ [${serverLabel}] You will no longer receive suspicious activity alerts.`);
         logger.info(`[DM] ${message.author.username} opted out of alerts`);
       } else if (content === '!optin') {
         await setAlertOptIn(message.author.id, true);
-        await message.reply("✅ You will now receive suspicious activity alerts.");
+        await message.reply(`✅ [${serverLabel}] You will now receive suspicious activity alerts.`);
         logger.info(`[DM] ${message.author.username} opted in to alerts`);
       }
     } catch (error) {
