@@ -20,7 +20,7 @@ if (!fs.existsSync(commandsPath)) {
 
 const commandFiles = fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'));
 
-console.log(`\n📦 PokemonSkill v0.02 - Command Registration`);
+console.log(`\n📦 PokemonSkill v0.03 - Command Registration`);
 console.log(`Found ${commandFiles.length} command files:\n`);
 
 const expectedCommands = [
@@ -91,7 +91,7 @@ const rest = new REST({ version: '10' }).setToken(config.token);
       { body: commands }
     );
 
-    console.log(`\n🎉 Successfully registered ${commands.length} commands for PokemonSkill v0.02!`);
+    console.log(`\n🎉 Successfully registered ${commands.length} commands for PokemonSkill v0.03!`);
     console.log('✅ Commands registered for your Pokémon server only');
     console.log('💡 Commands update instantly for guild-specific registration\n');
     
@@ -133,12 +133,11 @@ const rest = new REST({ version: '10' }).setToken(config.token);
     }
     
     console.log('');
-    console.log('📖 Changes in v0.02:');
-    console.log('   • More reliable 👍 game confirmations (reaction collector survives cache eviction)');
-    console.log('   • Ghost-game prevention: games count only after results are written; startup sweep archives any orphans');
-    console.log('   • Crash-safe shutdown: WAL checkpoint on stop so ratings are never stranded');
-    console.log('   • Clearer admin auto-confirm message (before → after rating)');
-    console.log('   • Trimmed unused gateway intents to cut event load');
+    console.log('📖 Changes in v0.03:');
+    console.log('   • Linear rating decay: -1 Elo/day after 6 days inactive (stops at 1050)');
+    console.log('   • Participation bonus: +1 Elo for every ranked game played');
+    console.log('   • New /timewalk command: fast-forward decay cycle for testing');
+    console.log('   • New /help command: show help for commands');
     console.log('');
     
   } catch (error) {

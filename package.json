@@ -1,6 +1,6 @@
 {
   "name": "pokemon-skill-bot",
-  "version": "0.02",
+  "version": "0.03",
   "description": "Discord bot for 1v1 Pokémon ranked games (TCG Pocket and Showdown) using OpenSkill",
   "type": "module",
   "main": "dist/bot.js",

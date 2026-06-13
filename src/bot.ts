@@ -32,22 +32,12 @@ export interface ExtendedClient extends Client {
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    // GuildMessages/MessageContent stay OUT on purpose: the messageCreate
-    // handler only acts on DMs (it returns immediately for guild messages),
-    // and DM content is delivered without those privileged intents. They were
-    // the real gateway-event flood source in large servers, so the bot omits
-    // them.
-    // REQUIRED for game confirmations. Game results are confirmed via
-    // replyMsg.createReactionCollector(...) in commands/rank.ts; reaction
-    // collectors only receive events when this intent is enabled. Do NOT
-    // remove it (doing so silently breaks all player 👍 confirmations while
-    // admin auto-submit keeps working, because that's an interaction).
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.DirectMessages,
   ],
-  // Message/Reaction partials let the collector still receive reactions if the
-  // confirmation message is evicted from cache during its confirmation window.
-  partials: [Partials.Channel, Partials.Message, Partials.Reaction],
+  partials: [Partials.Channel],
 }) as ExtendedClient;
 
 client.commands = new Collection();
