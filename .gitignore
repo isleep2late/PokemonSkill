@@ -40,3 +40,6 @@ backups/
 
 # Claude Code session-local settings
 .claude/settings.local.json
+
+# logs/ is a symlink to /mnt/hdd1/ibot2late-logs (machine-specific)
+/logs
